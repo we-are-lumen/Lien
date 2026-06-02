@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc_version = "0.8.28"
+optimizer = true
+optimizer_runs = 200
+evm_version = "paris"
+
+[rpc_endpoints]
+mantle_testnet = "${MANTLE_RPC_URL}"
+
+[etherscan]
+mantle_testnet = { key = "${MANTLESCAN_API_KEY}", url = "https://explorer.testnet.mantle.xyz/api" }

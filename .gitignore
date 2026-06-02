@@ -1,0 +1,29 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+node_modules/
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/lib/
+contracts/broadcast/
+
+# Secrets
+ai_verifier_wallet.json
+*.key
+
+# Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
