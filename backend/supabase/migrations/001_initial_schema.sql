@@ -35,6 +35,8 @@ create type repayment_status as enum (
   'paid',
   'overdue'
 );
+create type risk_tier as enum ('low', 'medium', 'high');
+create type agent_decision_verdict as enum ('approved', 'rejected', 'flagged', 'escalated');
 
 -- ============================================================
 -- TABLES
@@ -58,6 +60,7 @@ create table invoices (
   ai_stage_c          jsonb,                            -- relationship check
   ai_stage_d          jsonb,                            -- double-financing check
   ai_score            numeric(5, 4),                    -- 0.0000 - 1.0000
+  risk_tier           risk_tier,
   rejection_reason    text,
   created_at          timestamptz default now(),
   updated_at          timestamptz default now()
@@ -75,12 +78,14 @@ create table purchase_orders (
   total_amount        numeric(20, 6),
   currency            text default 'USDT0',
   delivery_date       date,
+  buyer_confirmed     boolean default false,            -- Q10: optional, deduct 10pts if false
   status              document_status default 'pending',
   ai_stage_a          jsonb,
   ai_stage_b          jsonb,
   ai_stage_c          jsonb,
   ai_stage_d          jsonb,
   ai_score            numeric(5, 4),
+  risk_tier           risk_tier,
   rejection_reason    text,
   created_at          timestamptz default now(),
   updated_at          timestamptz default now()
@@ -96,6 +101,7 @@ create table financing_requests (
   funded_amount       numeric(20, 6) default 0,
   interest_rate_bps   integer not null,                 -- basis points, e.g. 500 = 5%
   tenure_days         integer not null,
+  advance_rate        numeric(5, 4),                    -- PO: 0.70-0.80 by risk tier; Invoice: 1.0
   status              financing_status default 'open',
   pool_address        text,                             -- FundingPool contract address
   token_id            bigint,                           -- ERC-1155 FinancingToken ID
@@ -107,7 +113,7 @@ create table financing_requests (
   updated_at          timestamptz default now()
 );
 
--- 4. Milestones (PO financing only)
+-- 4. Milestones (Invoice: M1-M3 at 30/50/20%; PO: M1-M4 at 30/30/20/20%)
 create table milestones (
   id                  uuid primary key default uuid_generate_v4(),
   financing_id        uuid not null references financing_requests(id) on delete cascade,
@@ -264,3 +270,56 @@ create policy "repayments_borrower_insert" on repayments
 
 -- NOTE: Backend uses SUPABASE_SERVICE_KEY which bypasses RLS entirely.
 -- RLS here is defense-in-depth for direct DB access or anon key usage.
+
+-- ============================================================
+-- AGENT LOOP TABLES (BE-8: autonomous on-chain agent)
+-- ============================================================
+
+-- 6. Agent Queue - on-chain events pending AI processing
+create table agent_queue (
+  id                  uuid primary key default uuid_generate_v4(),
+  event_type          text not null,                    -- e.g. 'ProofSubmitted', 'FinancingFunded'
+  financing_id        uuid references financing_requests(id),
+  milestone_index     smallint,
+  proof_ipfs_hash     text,
+  submitted_by        text,                             -- wallet that submitted proof
+  tx_hash             text,                             -- on-chain event tx
+  block_number        bigint,
+  status              text default 'pending'            -- pending | processing | done | failed
+    check (status in ('pending', 'processing', 'done', 'failed')),
+  picked_up_at        timestamptz,
+  created_at          timestamptz default now(),
+  updated_at          timestamptz default now()
+);
+
+-- 7. Agent Decisions - audit trail of all AI verdicts
+create table agent_decisions (
+  id                  uuid primary key default uuid_generate_v4(),
+  queue_id            uuid references agent_queue(id),
+  financing_id        uuid references financing_requests(id),
+  milestone_index     smallint,
+  verdict             agent_decision_verdict not null,
+  confidence_score    numeric(5, 4) not null,           -- 0.0000 - 1.0000
+  reasoning           text,                             -- Claude's reasoning summary
+  stage_results       jsonb,                            -- full per-stage breakdown
+  tx_hash             text,                             -- releaseMilestone() tx if approved
+  verifier_address    text,                             -- AI Verifier wallet address
+  created_at          timestamptz default now()
+);
+
+create index idx_agent_queue_status on agent_queue(status);
+create index idx_agent_queue_financing on agent_queue(financing_id);
+create index idx_agent_decisions_financing on agent_decisions(financing_id);
+
+create trigger trg_agent_queue_updated_at
+  before update on agent_queue
+  for each row execute function set_updated_at();
+
+alter table agent_queue enable row level security;
+alter table agent_decisions enable row level security;
+
+-- Agent queue: only BE service role reads/writes (bypass via service key)
+-- Agent decisions: public read for transparency (audit trail)
+create policy "agent_decisions_public_select" on agent_decisions
+  for select using (true);
+
