@@ -25,6 +25,25 @@ Smart contracts for the LIEN invoice/PO financing platform on Mantle.
 - **investor** — funds via `FundingPool.fund()`, holds the financing token.
 - **supplier** — receives milestone payouts; settles via `FundingPool.repay()`.
 
+## Agent-loop integration
+
+`FundingPool` exposes an event-driven hook for the off-chain AI agent:
+
+| Step | On-chain | Off-chain |
+|------|----------|-----------|
+| Upload | — | FE POSTs file to `/financing/{id}/milestone-proof`, BE returns CID |
+| Signal | Supplier calls `FundingPool.submitProof(tokenId, milestoneIdx, ipfsCid)` | — |
+| | Contract emits `ProofSubmitted(tokenId, milestoneIdx, ipfsCid, supplier)` | Goldsky subgraph forwards to `POST /agent/webhook` |
+| Verify | — | Agent fetches file, runs Claude Vision |
+| Release | Agent EOA calls `FundingPool.releaseMilestone(tokenId, milestoneIdx)` | Audit row written to `agent_decisions` |
+
+`submitProof` constraints:
+- Pure signaling — no state change, no token transfer.
+- Only the deal's `supplier` can call it. Investors, AI verifier, and randoms revert with `NotSupplier`.
+- `milestoneIdx == 1` reverts with `CannotSubmitM1` (M1 auto-releases inside `fund()`).
+- Already-released milestones revert with `MilestoneAlreadyReleased`.
+- Unknown `tokenId` reverts with `UnknownDeal`.
+
 ## Build + test
 
 ```bash

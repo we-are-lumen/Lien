@@ -201,4 +201,60 @@ contract FundingPoolTest is Test {
         pool.repay(tokenId);
         vm.stopPrank();
     }
+
+    // --- submitProof ---------------------------------------------------------
+
+    event ProofSubmitted(
+        uint256 indexed tokenId,
+        uint8 indexed milestoneIdx,
+        string ipfsCid,
+        address indexed submittedBy
+    );
+
+    function test_submitProof_emitsEvent() public {
+        uint256 tokenId = _fund(10_000 * 10 ** 6, 700 * 10 ** 6);
+        string memory cid = "bafkreigh2akiscaildc";
+
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit ProofSubmitted(tokenId, 2, cid, supplier);
+
+        vm.prank(supplier);
+        pool.submitProof(tokenId, 2, cid);
+    }
+
+    function test_submitProof_revertsIfNotSupplier() public {
+        uint256 tokenId = _fund(10_000 * 10 ** 6, 700 * 10 ** 6);
+
+        vm.expectRevert(FundingPool.NotSupplier.selector);
+        vm.prank(investor);
+        pool.submitProof(tokenId, 2, "bafkreix");
+    }
+
+    function test_submitProof_revertsIfM1() public {
+        uint256 tokenId = _fund(10_000 * 10 ** 6, 700 * 10 ** 6);
+
+        vm.expectRevert(FundingPool.CannotSubmitM1.selector);
+        vm.prank(supplier);
+        pool.submitProof(tokenId, 1, "bafkreix");
+    }
+
+    function test_submitProof_revertsIfAlreadyReleased() public {
+        uint256 tokenId = _fund(10_000 * 10 ** 6, 700 * 10 ** 6);
+
+        // Release M2 via the AI verifier.
+        vm.prank(ai);
+        pool.releaseMilestone(tokenId, 2);
+
+        vm.expectRevert(FundingPool.MilestoneAlreadyReleased.selector);
+        vm.prank(supplier);
+        pool.submitProof(tokenId, 2, "bafkreix");
+    }
+
+    function test_submitProof_revertsIfUnknownDeal() public {
+        uint256 unknownTokenId = 9_999_999;
+
+        vm.expectRevert(FundingPool.UnknownDeal.selector);
+        vm.prank(supplier);
+        pool.submitProof(unknownTokenId, 2, "bafkreix");
+    }
 }
