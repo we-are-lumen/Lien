@@ -23,6 +23,11 @@ PINATA_UPLOAD_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
 PINATA_JSON_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
 PINATA_GATEWAY = "https://gateway.pinata.cloud/ipfs"
 
+# Cap on bytes fetched from IPFS gateway. Real proof documents are PDF/image
+# scans well under this; the cap is a defensive guard against a leaked webhook
+# secret pointing the agent at an oversized CID and OOMing the worker.
+MAX_PROOF_BYTES = 25 * 1024 * 1024  # 25 MiB
+
 
 @dataclass
 class UploadResult:
@@ -115,14 +120,27 @@ class PinataIPFSClient(IPFSClient):
         return UploadResult(cid=cid, url=f"{PINATA_GATEWAY}/{cid}")
 
     async def fetch_bytes(self, cid: str) -> bytes:
-        """Fetch file bytes from Pinata gateway."""
+        """Fetch file bytes from Pinata gateway.
+
+        Caps the response at MAX_PROOF_BYTES so a malicious CID (or a leaked
+        webhook secret aimed at a giant file) can't OOM the worker. Documents
+        in the supplier upload flow are bounded server-side already; this is
+        defence-in-depth for the agent loop's untrusted fetch path.
+        """
         import httpx
 
         url = f"{PINATA_GATEWAY}/{cid}"
         try:
-            resp = await self._client.get(url)
-            resp.raise_for_status()
-            return resp.content
+            async with self._client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > MAX_PROOF_BYTES:
+                        raise ValueError(
+                            f"Proof file from {cid} exceeds {MAX_PROOF_BYTES} bytes; refusing to load"
+                        )
+                return bytes(buf)
         except httpx.HTTPStatusError as exc:
             log.error("Pinata fetch failed for %s: %s", cid, exc.response.status_code)
             raise
