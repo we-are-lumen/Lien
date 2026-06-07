@@ -19,10 +19,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 
-from app.core.auth import require_auth
+from app.core.auth import require_auth, require_auth_optional
 from app.core.errors import BadRequest, Conflict, NotFound
 from app.models import schemas
-from app.services import repos
+from app.services import buyer_anonymization, repos
 
 
 router = APIRouter()
@@ -135,18 +135,36 @@ async def marketplace(
 
 
 @router.get("/financing/{financing_id}", response_model=schemas.FinancingDetail)
-async def get_financing_detail(financing_id: str) -> schemas.FinancingDetail:
+async def get_financing_detail(
+    financing_id: str,
+    address: Optional[str] = Depends(require_auth_optional),
+) -> schemas.FinancingDetail:
     row = repos.get_financing_full(financing_id)
     if not row:
         raise NotFound("Financing not found")
 
     doc = row.get("documents") or {}
     milestones = sorted(row.get("milestones") or [], key=lambda m: m["idx"])
+
+    # Buyer name: visible to the supplier and the buyer themselves; anonymized
+    # (unless IDX-listed) for everyone else, including unauthenticated viewers.
+    raw_buyer = doc.get("buyer_name", "")
+    viewer_is_party = False
+    if address:
+        viewer = repos.get_user_by_address(address)
+        if viewer:
+            viewer_id = viewer["id"]
+            if viewer_id == row.get("supplier_id") or viewer_id == row.get("buyer_id"):
+                viewer_is_party = True
+    buyer_name = buyer_anonymization.maybe_anonymize(
+        raw_buyer, viewer_is_party=viewer_is_party
+    )
+
     return schemas.FinancingDetail(
         id=row["id"],
         invoice_number=doc.get("invoice_number") or doc.get("po_number") or "",
         amount=float(row["amount"]),
-        buyer_name=doc.get("buyer_name", ""),
+        buyer_name=buyer_name,
         due_date=row["due_date"],
         payment_status=row["payment_status"],
         yield_rate=float(row["yield_rate"]),

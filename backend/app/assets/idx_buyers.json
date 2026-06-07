@@ -1,0 +1,31 @@
+{
+  "_comment": "Indonesia Stock Exchange (IDX) listed companies — buyers whose names may be disclosed publicly in the marketplace. Match is case-insensitive and trims whitespace + the 'PT ', 'Tbk' suffix. Non-listed buyers are anonymized as 'Buyer_<hash8>'.",
+  "_source": "https://www.idx.co.id/en/listed-companies/listed-companies",
+  "buyers": [
+    "PT Telekomunikasi Indonesia",
+    "PT Astra International",
+    "PT Bank Central Asia",
+    "PT Bank Mandiri",
+    "PT Bank Rakyat Indonesia",
+    "PT Bank Negara Indonesia",
+    "PT Unilever Indonesia",
+    "PT Indofood Sukses Makmur",
+    "PT Indofood CBP Sukses Makmur",
+    "PT Gudang Garam",
+    "PT Hanjaya Mandala Sampoerna",
+    "PT Sumber Alfaria Trijaya",
+    "PT Indomarco Prismatama",
+    "PT Semen Indonesia",
+    "PT Indocement Tunggal Prakarsa",
+    "PT Pertamina",
+    "PT Perusahaan Listrik Negara",
+    "PT United Tractors",
+    "PT Adaro Energy Indonesia",
+    "PT Bukit Asam",
+    "PT Kalbe Farma",
+    "PT Mayora Indah",
+    "PT XL Axiata",
+    "PT Indosat",
+    "PT Jasa Marga"
+  ]
+}
