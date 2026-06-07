@@ -257,4 +257,86 @@ contract FundingPoolTest is Test {
         vm.prank(supplier);
         pool.submitProof(unknownTokenId, 2, "bafkreix");
     }
+
+    // --- fundWithRef ---------------------------------------------------------
+
+    event FundedWithRef(
+        uint256 indexed tokenId,
+        address indexed investor,
+        bytes32 indexed financingRef,
+        uint256 amount
+    );
+
+    function test_fundWithRef_emitsRefEvent() public {
+        uint256 tokenId = _mintToken(investor);
+        uint256 funded = 10_000 * 10 ** 6;
+        uint256 yieldAmt = 700 * 10 ** 6;
+        uint8[4] memory split = [30, 50, 20, 0];
+        bytes32 ref = keccak256(abi.encodePacked("123e4567-e89b-12d3-a456-426614174000"));
+
+        vm.startPrank(investor);
+        usdt.approve(address(pool), funded);
+
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit FundedWithRef(tokenId, investor, ref, funded);
+
+        pool.fundWithRef(
+            tokenId,
+            funded,
+            funded + yieldAmt,
+            supplier,
+            3,
+            split,
+            10_000 * 10 ** 6,
+            ref
+        );
+        vm.stopPrank();
+    }
+
+    function test_fundWithRef_sameSideEffectsAsFund() public {
+        // Two parallel mints, two parallel funds: one via fund(), one via
+        // fundWithRef(). Treasury fee, M1 payout, and deal state must match.
+        uint256 funded = 10_000 * 10 ** 6;
+        uint256 yieldAmt = 700 * 10 ** 6;
+        uint8[4] memory split = [30, 50, 20, 0];
+
+        uint256 supplierBefore = usdt.balanceOf(supplier);
+        uint256 treasuryBefore = usdt.balanceOf(treasury);
+
+        uint256 tokenA = _fund(funded, yieldAmt);
+
+        uint256 supplierAfterA = usdt.balanceOf(supplier);
+        uint256 treasuryAfterA = usdt.balanceOf(treasury);
+
+        uint256 tokenB = _mintToken(investor);
+        vm.startPrank(investor);
+        usdt.approve(address(pool), funded);
+        pool.fundWithRef(
+            tokenB,
+            funded,
+            funded + yieldAmt,
+            supplier,
+            3,
+            split,
+            10_000 * 10 ** 6,
+            keccak256(abi.encodePacked("ref-b"))
+        );
+        vm.stopPrank();
+
+        // Both deals applied the same origination fee and M1 payout.
+        assertEq(
+            usdt.balanceOf(treasury) - treasuryAfterA,
+            treasuryAfterA - treasuryBefore,
+            "treasury fee parity"
+        );
+        assertEq(
+            usdt.balanceOf(supplier) - supplierAfterA,
+            supplierAfterA - supplierBefore,
+            "supplier M1 payout parity"
+        );
+
+        // M1 released on both deals.
+        assertTrue(pool.milestoneReleased(tokenA, 1));
+        assertTrue(pool.milestoneReleased(tokenB, 1));
+    }
 }

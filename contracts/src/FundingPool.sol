@@ -47,6 +47,16 @@ contract FundingPool is Ownable, ReentrancyGuard {
     mapping(uint256 => mapping(uint8 => bool)) public milestoneReleased;
 
     event Funded(uint256 indexed tokenId, address indexed investor, uint256 amount);
+    /// @notice Funded event variant that also carries an off-chain financing
+    ///         reference (keccak256 of the BE financing UUID). Indexers use
+    ///         this to map on-chain tokenId to the off-chain financing row
+    ///         deterministically, without heuristic matching.
+    event FundedWithRef(
+        uint256 indexed tokenId,
+        address indexed investor,
+        bytes32 indexed financingRef,
+        uint256 amount
+    );
     event MilestoneReleased(uint256 indexed tokenId, uint8 indexed milestoneIdx, uint256 amount);
     event Repaid(uint256 indexed tokenId, uint256 totalPaid, uint256 toInvestor);
     event Defaulted(uint256 indexed tokenId);
@@ -122,6 +132,55 @@ contract FundingPool is Ownable, ReentrancyGuard {
         uint8[4] calldata milestoneSplitBps,
         uint256 nominal
     ) external nonReentrant {
+        _fund(
+            tokenId,
+            fundedAmount,
+            totalRepayment,
+            supplier,
+            milestoneCount,
+            milestoneSplitBps,
+            nominal,
+            bytes32(0)
+        );
+    }
+
+    /// @notice Same as fund(), plus a bytes32 off-chain reference (keccak256
+    ///         of the BE financing UUID) emitted via FundedWithRef. Off-chain
+    ///         indexers use this to deterministically resolve tokenId to
+    ///         financing_id without heuristic matching.
+    /// @param  financingRef    keccak256(abi.encodePacked(financingUuid))
+    function fundWithRef(
+        uint256 tokenId,
+        uint256 fundedAmount,
+        uint256 totalRepayment,
+        address supplier,
+        uint8 milestoneCount,
+        uint8[4] calldata milestoneSplitBps,
+        uint256 nominal,
+        bytes32 financingRef
+    ) external nonReentrant {
+        _fund(
+            tokenId,
+            fundedAmount,
+            totalRepayment,
+            supplier,
+            milestoneCount,
+            milestoneSplitBps,
+            nominal,
+            financingRef
+        );
+    }
+
+    function _fund(
+        uint256 tokenId,
+        uint256 fundedAmount,
+        uint256 totalRepayment,
+        address supplier,
+        uint8 milestoneCount,
+        uint8[4] calldata milestoneSplitBps,
+        uint256 nominal,
+        bytes32 financingRef
+    ) internal {
         if (deals[tokenId].fundedAmount > 0) revert AlreadyFunded();
         if (milestoneCount != 3 && milestoneCount != 4) revert MilestoneOutOfRange();
 
@@ -150,6 +209,9 @@ contract FundingPool is Ownable, ReentrancyGuard {
         });
 
         emit Funded(tokenId, msg.sender, fundedAmount);
+        if (financingRef != bytes32(0)) {
+            emit FundedWithRef(tokenId, msg.sender, financingRef, fundedAmount);
+        }
 
         // Auto-release M1.
         _releaseMilestone(tokenId, 1);
