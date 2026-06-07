@@ -545,7 +545,7 @@ def _advance_financing_status(financing_id: str) -> None:
 
     milestones = (
         sb.table("milestones")
-        .select("status, idx")
+        .select("status, idx, release_tx_hash")
         .eq("financing_id", financing_id)
         .execute()
     ).data or []
@@ -553,12 +553,30 @@ def _advance_financing_status(financing_id: str) -> None:
     if not milestones:
         return
 
-    all_released = all(m["status"] == "released" for m in milestones)
-    any_released = any(m["status"] == "released" for m in milestones)
+    # Count a milestone as released only when it has an on-chain release_tx_hash.
+    # _process_job sets status="released" BEFORE the chain call (line ordering is
+    # deliberate for crash-recovery), so a milestone can be status="released" yet
+    # not actually disbursed if the chain call hit PriorMilestoneNotReleased and
+    # the job was re-queued. release_tx_hash is the source of truth for on-chain
+    # release.
+    def _is_released(m: dict) -> bool:
+        return m["status"] == "released" and bool(m.get("release_tx_hash"))
 
-    if all_released:
-        sb.table("financings").update({"status": "repaid"}).eq("id", financing_id).execute()
-    elif any_released:
+    any_released = any(_is_released(m) for m in milestones)
+
+    # Only transition to `in_progress` when at least one milestone has released.
+    #
+    # NOTE on `repaid`: do NOT auto-flip to `repaid` here, even when all
+    # milestones are released. Per the on-chain state machine,
+    #   - MilestoneReleased = investor's escrow disburses to supplier
+    #   - Repaid             = supplier pays the investor back (FundingPool.repay)
+    # "All milestones released" only means the supplier has received the full
+    # advance. The investor has NOT been repaid yet. Marking it `repaid` here
+    # would mis-state the money flow.
+    #
+    # The correct trigger for status=`repaid` is the on-chain Repaid event,
+    # which needs a separate Goldsky listener + handler. Not in scope for PR #7.
+    if any_released:
         sb.table("financings").update({"status": "in_progress"}).eq("id", financing_id).execute()
 
 
