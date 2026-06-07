@@ -82,3 +82,23 @@ async def require_auth(authorization: Optional[str] = Header(default=None)) -> s
     if not address:
         raise Unauthorized("Token missing subject")
     return address
+
+
+async def require_auth_optional(
+    authorization: Optional[str] = Header(default=None),
+) -> Optional[str]:
+    """Same as require_auth but returns None when no/invalid token is present.
+
+    For endpoints that surface different content per viewer (e.g. buyer name
+    de-anonymization for the supplier and buyer) but are also browseable
+    unauthenticated.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = decode_token(token)
+    except Unauthorized:
+        return None
+    address = payload.get("sub")
+    return address if isinstance(address, str) else None

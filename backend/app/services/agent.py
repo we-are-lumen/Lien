@@ -314,8 +314,9 @@ async def _process_job(job: dict) -> None:
             queue_id,
         )
         # M1 was released on-chain by fund() but the DB row may still be 'pending'.
-        # Sync it so _advance_financing_status can correctly detect when all
-        # milestones are released and transition financing → 'repaid'.
+        # Sync it so _advance_financing_status can correctly transition the
+        # financing to 'in_progress'. ('repaid' is set by /agent/repaid-webhook
+        # when the on-chain Repaid event fires, not by milestone progression.)
         try:
             await asyncio.to_thread(_update_milestone_status, financing_id, milestone_idx, {
                 "status": "released",
@@ -545,7 +546,7 @@ async def _process_job(job: dict) -> None:
         await asyncio.to_thread(_mark_failed, queue_id, str(exc))
 
 
-_TERMINAL_FINANCING_STATUSES = {"defaulted", "blacklisted", "frozen"}
+_TERMINAL_FINANCING_STATUSES = {"repaid", "defaulted", "blacklisted", "frozen"}
 
 
 def _advance_financing_status(financing_id: str) -> None:
