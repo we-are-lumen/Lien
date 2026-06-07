@@ -1,14 +1,32 @@
 """IPFS upload service.
 
-Mock returns a deterministic fake CID. Real implementation will call Pinata.
+Mock returns a deterministic fake CID. Real implementation calls Pinata API.
+
+Set IPFS_MOCK_MODE=false and provide:
+  PINATA_JWT   — Bearer token from Pinata dashboard (pinFileToIPFS scope)
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from dataclasses import dataclass
 
+from typing import Optional
+
 from app.core.config import get_settings
+
+log = logging.getLogger(__name__)
+
+PINATA_UPLOAD_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+PINATA_JSON_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
+PINATA_GATEWAY = "https://gateway.pinata.cloud/ipfs"
+
+# Cap on bytes fetched from IPFS gateway. Real proof documents are PDF/image
+# scans well under this; the cap is a defensive guard against a leaked webhook
+# secret pointing the agent at an oversized CID and OOMing the worker.
+MAX_PROOF_BYTES = 25 * 1024 * 1024  # 25 MiB
 
 
 @dataclass
@@ -24,6 +42,9 @@ class IPFSClient:
     async def upload_json(self, data: dict, name: str = "metadata.json") -> UploadResult:
         raise NotImplementedError
 
+    async def fetch_bytes(self, cid: str) -> bytes:
+        raise NotImplementedError
+
 
 class MockIPFSClient(IPFSClient):
     """Returns a fake CID derived from sha256 so repeated uploads of the same
@@ -35,13 +56,104 @@ class MockIPFSClient(IPFSClient):
         return UploadResult(cid=cid, url=f"https://mock-ipfs.lien.local/ipfs/{cid}")
 
     async def upload_json(self, data: dict, name: str = "metadata.json") -> UploadResult:
-        import json
         payload = json.dumps(data, sort_keys=True).encode()
         return await self.upload_bytes(payload, name)
 
+    async def fetch_bytes(self, cid: str) -> bytes:
+        """Deterministic fake proof file. No HTTP, no Pinata."""
+        return b"mock-proof-file-" + cid.encode()
+
+
+class PinataIPFSClient(IPFSClient):
+    """Real IPFS client via Pinata API.
+
+    Reads PINATA_JWT from Settings. All calls are async via httpx.
+    """
+
+    def __init__(self) -> None:
+        import httpx
+
+        settings = get_settings()
+        if not settings.pinata_jwt:
+            raise RuntimeError("PINATA_JWT is not set — cannot use real IPFS client")
+
+        self._headers = {"Authorization": f"Bearer {settings.pinata_jwt}"}
+        self._client = httpx.AsyncClient(timeout=60.0)
+
+    async def upload_bytes(self, data: bytes, filename: str) -> UploadResult:
+        import httpx
+
+        files = {"file": (filename, data)}
+        try:
+            resp = await self._client.post(
+                PINATA_UPLOAD_URL,
+                headers=self._headers,
+                files=files,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            log.error("Pinata upload failed: %s %s", exc.response.status_code, exc.response.text)
+            raise
+
+        cid = resp.json()["IpfsHash"]
+        return UploadResult(cid=cid, url=f"{PINATA_GATEWAY}/{cid}")
+
+    async def upload_json(self, data: dict, name: str = "metadata.json") -> UploadResult:
+        import httpx
+
+        body = {
+            "pinataContent": data,
+            "pinataMetadata": {"name": name},
+        }
+        try:
+            resp = await self._client.post(
+                PINATA_JSON_URL,
+                headers={**self._headers, "Content-Type": "application/json"},
+                content=json.dumps(body),
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            log.error("Pinata JSON upload failed: %s %s", exc.response.status_code, exc.response.text)
+            raise
+
+        cid = resp.json()["IpfsHash"]
+        return UploadResult(cid=cid, url=f"{PINATA_GATEWAY}/{cid}")
+
+    async def fetch_bytes(self, cid: str) -> bytes:
+        """Fetch file bytes from Pinata gateway.
+
+        Caps the response at MAX_PROOF_BYTES so a malicious CID (or a leaked
+        webhook secret aimed at a giant file) can't OOM the worker. Documents
+        in the supplier upload flow are bounded server-side already; this is
+        defence-in-depth for the agent loop's untrusted fetch path.
+        """
+        import httpx
+
+        url = f"{PINATA_GATEWAY}/{cid}"
+        try:
+            async with self._client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > MAX_PROOF_BYTES:
+                        raise ValueError(
+                            f"Proof file from {cid} exceeds {MAX_PROOF_BYTES} bytes; refusing to load"
+                        )
+                return bytes(buf)
+        except httpx.HTTPStatusError as exc:
+            log.error("Pinata fetch failed for %s: %s", cid, exc.response.status_code)
+            raise
+
+
+_real_singleton: Optional[IPFSClient] = None
+
 
 def get_ipfs_client() -> IPFSClient:
+    global _real_singleton
     settings = get_settings()
     if settings.ipfs_mock_mode:
         return MockIPFSClient()
-    raise NotImplementedError("Pinata client not wired yet — set IPFS_MOCK_MODE=true")
+    if _real_singleton is None:
+        _real_singleton = PinataIPFSClient()
+    return _real_singleton

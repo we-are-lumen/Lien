@@ -7,7 +7,7 @@ does not touch ``os.environ`` directly.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     jwt_expires_seconds: int = 86_400
     nonce_expires_seconds: int = 300
 
+    # Agent webhook (Goldsky -> POST /agent/webhook). If None/empty, dev mode
+    # accepts all incoming webhook calls.
+    webhook_secret: Optional[str] = None
+
     # Feature switches (mock vs real services)
     ai_mock_mode: bool = True
     ipfs_mock_mode: bool = True
@@ -38,6 +42,12 @@ class Settings(BaseSettings):
     # External services
     pinata_jwt: str = ""
     mantle_rpc_url: str = "https://rpc.sepolia.mantle.xyz"
+
+    # Anthropic (real AI verifier). The SDK reads ANTHROPIC_API_KEY from env
+    # automatically, but we surface it here so the rest of the code does not
+    # touch os.environ directly.
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-4-8"
 
     # Contract addresses
     invoice_registry_address: str = ""

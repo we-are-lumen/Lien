@@ -80,7 +80,98 @@ Implemented endpoints:
 - `GET /<role>/financing` (suppliers, investors, buyers)
 - `GET /financing/{id}`, `GET /financing/{id}/report`
 - `POST /financing/{id}/fund`
-- `POST /financing/{id}/milestone-proof`
+- `POST /financing/{id}/milestone-proof` — IPFS upload only, see [Milestone proof flow](#milestone-proof-flow-fe-integration)
 - `GET /marketplace`
 - `POST /documents/upload`
 - `GET /milestones/options`
+- `POST /agent/webhook` — Goldsky-only, X-Webhook-Secret required
+- `GET /agent/status` — last 20 queue jobs + decisions
+- `GET /agent/decisions/{financing_id}` — full verdict history for a financing
+
+## Milestone proof flow (FE integration)
+
+**The autonomous AI agent owns milestone verification.** The HTTP endpoint
+`POST /financing/{id}/milestone-proof` is now IPFS-only — it does not call
+Claude and does not release the milestone on-chain. That work runs inside the
+agent loop, triggered by an on-chain `ProofSubmitted` event.
+
+### Sequence
+
+```
+1. Supplier uploads file
+     POST /financing/{financing_id}/milestone-proof
+       form: file=<binary>, milestone_idx=<2|3|4>
+     -> 200 { milestone_id, cid, url, status: "proof_uploaded", next_step }
+
+2. Supplier signs an on-chain tx (wagmi/viem):
+     FundingPool.submitProof(tokenId, milestoneIdx, cid)
+     -> emits ProofSubmitted(tokenId, milestoneIdx, ipfsCid, supplier)
+
+3. Goldsky subgraph indexes the event and POSTs:
+     POST /agent/webhook  (X-Webhook-Secret header)
+       { token_id, milestone_idx, ipfs_hash, submitted_by }
+     -> 200 { queued: true, queue_id }
+
+4. Agent loop picks up the job (within ~5s):
+     - fetches the file from IPFS
+     - runs Claude Vision verification
+     - if APPROVED + confidence >= 0.75 -> releaseMilestone() on-chain
+     - writes agent_decisions audit row
+     - sets milestone.status to released/rejected/escalated
+
+5. FE polls for the result:
+     GET /agent/decisions/{financing_id}
+     -> 200 { decisions: [{ milestone_idx, verdict, confidence, tx_hash, ... }] }
+```
+
+### Why two calls instead of one
+
+Step 1 puts the file on IPFS so it has a content-addressable identifier
+before any on-chain reference exists. Step 2 is the on-chain commitment that
+the proof was submitted — Goldsky listens to that event, not to HTTP traffic.
+The agent then acts on the event, not on the HTTP upload. This is what makes
+the verification autonomous rather than a synchronous tool call.
+
+### Polling
+
+`GET /agent/decisions/{financing_id}` is cheap (single indexed query). Poll
+every 2-5 seconds while a milestone is in `proof_uploaded` state. Stop polling
+when:
+- `milestone.status == "released"` (success: `tx_hash` is in the latest decision)
+- `milestone.status == "rejected"` (resubmittable: upload a new file, repeat from step 1)
+- `milestone.status == "escalated"` (low confidence: manual review required)
+
+The milestone status is the source of truth; the decision rows are the audit
+trail.
+
+### Constraints
+
+- `milestone_idx` must be in `2..4`. **M1 auto-releases at funding time** —
+  do not call `/milestone-proof` for M1 and do not call `submitProof(_, 1, _)`
+  on-chain (the contract reverts with `CannotSubmitM1`).
+- The CID returned in step 1 is the exact string to pass to `submitProof`.
+  No transformation needed.
+- Goldsky must include header `X-Webhook-Secret: <WEBHOOK_SECRET>` matching
+  the backend setting. The webhook handler verifies via `hmac.compare_digest`.
+- If `token_id` is not yet in the DB when the webhook fires, the response is
+  `{ queued: false, error: "..." }` (HTTP 200). Goldsky should retry; the
+  agent is idempotent on `(financing_id, milestone_idx, ipfs_hash)`.
+
+### Dev shortcut
+
+For local testing without Goldsky, POST directly to `/agent/webhook` after
+step 1. Same payload shape:
+
+```bash
+curl -X POST http://localhost:8000/agent/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+  -d '{
+    "token_id": 42,
+    "milestone_idx": 2,
+    "ipfs_hash": "<cid from step 1>",
+    "submitted_by": "0xabc..."
+  }'
+```
+
+Watch agent activity in the FastAPI server logs (look for `agent:` prefix).

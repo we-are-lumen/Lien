@@ -52,6 +52,15 @@ contract FundingPool is Ownable, ReentrancyGuard {
     event Defaulted(uint256 indexed tokenId);
     event AiVerifierUpdated(address indexed newAi);
     event TreasuryUpdated(address indexed newTreasury);
+    /// @notice Supplier signals that off-chain proof for a milestone has been
+    ///         uploaded to IPFS. AI agent picks this up via subgraph and runs
+    ///         verification autonomously. Pure signaling - no state change.
+    event ProofSubmitted(
+        uint256 indexed tokenId,
+        uint8 indexed milestoneIdx,
+        string ipfsCid,
+        address indexed submittedBy
+    );
 
     error NotAiVerifier();
     error AlreadyFunded();
@@ -63,6 +72,8 @@ contract FundingPool is Ownable, ReentrancyGuard {
     error AlreadySettled();
     error InsufficientPayment();
     error InvalidMilestoneSplit();
+    error NotSupplier();
+    error CannotSubmitM1();
 
     modifier onlyAi() {
         if (msg.sender != aiVerifier) revert NotAiVerifier();
@@ -149,6 +160,26 @@ contract FundingPool is Ownable, ReentrancyGuard {
     /// @notice AI Verifier releases a milestone after off-chain verification.
     function releaseMilestone(uint256 tokenId, uint8 milestoneIdx) external onlyAi nonReentrant {
         _releaseMilestone(tokenId, milestoneIdx);
+    }
+
+    // --- Proof submission (off-chain signal) --------------------------------
+
+    /// @notice Supplier emits proof-of-completion for a milestone. Pure
+    ///         signaling - no state change. The AI agent watches this event
+    ///         via subgraph and runs the verification + release flow.
+    ///         M1 cannot be submitted: it auto-releases at fund() time.
+    function submitProof(
+        uint256 tokenId,
+        uint8 milestoneIdx,
+        string calldata ipfsCid
+    ) external {
+        Deal storage d = deals[tokenId];
+        if (d.fundedAmount == 0) revert UnknownDeal();
+        if (milestoneIdx == 1) revert CannotSubmitM1();
+        if (milestoneIdx == 0 || milestoneIdx > d.milestoneCount) revert MilestoneOutOfRange();
+        if (milestoneReleased[tokenId][milestoneIdx]) revert MilestoneAlreadyReleased();
+        if (msg.sender != d.supplier) revert NotSupplier();
+        emit ProofSubmitted(tokenId, milestoneIdx, ipfsCid, msg.sender);
     }
 
     function _releaseMilestone(uint256 tokenId, uint8 milestoneIdx) internal {
