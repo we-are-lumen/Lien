@@ -219,10 +219,17 @@ async def fund_financing(
 ) -> dict:
     """Investor funds a financing.
 
-    In the real flow the investor signs the on-chain `fund()` tx directly
-    via wagmi. This endpoint exists for the BE to record the bookkeeping
-    after the tx confirms, OR (in mock mode) to simulate the funding flow
-    end-to-end without a chain.
+    Real mode (``chain_mock_mode=false``): the investor signs
+    ``FundingPool.fundWithRef(...)`` directly via wagmi. The on-chain ``fund()``
+    auto-releases M1 and emits both ``Funded`` and ``FundedWithRef``. Goldsky
+    forwards those events to ``/agent/funded-webhook``, which sets
+    ``financings.token_id`` and flips ``status=funded``. This endpoint records
+    the off-chain ``fundings`` row but does NOT call the chain — calling
+    ``release_milestone()`` here would revert because M1 is already released
+    on-chain by the investor's tx.
+
+    Mock mode (``chain_mock_mode=true``): no real chain, so this endpoint
+    simulates the auto-release end-to-end for FE testing.
     """
     fin = repos.get_financing(financing_id)
     if not fin:
@@ -234,6 +241,46 @@ async def fund_financing(
     if not user:
         raise BadRequest("User not registered")
 
+    # Guard against double-funding: the on-chain contract reverts AlreadyFunded
+    # on a second fund() call, but in real mode the BE inserts the fundings
+    # row BEFORE the on-chain tx confirms (status stays 'published' until
+    # Goldsky lands the FundedWithRef event seconds-to-minutes later).
+    # Without this check, an investor double-clicking, two concurrent
+    # investors, or a stale FE refresh would each create a phantom fundings
+    # row. /investors/financing would surface non-existent investments and
+    # the FE yield math would be wrong.
+    from app.core.db import get_supabase
+    sb = get_supabase()
+    existing = (
+        sb.table("fundings")
+        .select("id, investor_id")
+        .eq("financing_id", financing_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if existing:
+        prior = existing[0]
+        if prior.get("investor_id") == user["id"]:
+            # Same investor clicking twice. Idempotent: return the existing
+            # funding without inserting a duplicate.
+            return {
+                "funding_id": prior["id"],
+                "status": "awaiting_chain_confirmation",
+                "duplicate": True,
+                "note": (
+                    "An earlier call already recorded this funding intent. "
+                    "If your wallet tx didn't land, retry from your wallet directly."
+                ),
+            }
+        # A different investor already claimed this financing. The on-chain
+        # contract is the source of truth and will revert AlreadyFunded for
+        # whoever signs second. Block here so the loser doesn't see a
+        # phantom funding in their /investors/financing list.
+        raise Conflict(
+            "Another investor has already initiated funding for this financing. "
+            "Wait for on-chain confirmation."
+        )
+
     funding = repos.insert_funding(
         {
             "financing_id": financing_id,
@@ -243,25 +290,40 @@ async def fund_financing(
         }
     )
 
-    # Auto-release M1 (always idx=1, auto=true) and flip status.
-    from app.services.chain import get_chain_client
-    chain = get_chain_client()
-    release = await chain.release_milestone(financing_id, 1)
-    m1 = repos.get_milestone(financing_id, 1)
-    if m1:
-        repos.update_milestone(
-            m1["id"],
-            {"status": "released", "release_tx_hash": release.tx_hash},
-        )
+    from app.core.config import get_settings
+    settings = get_settings()
 
-    # Flip financing status.
-    from app.core.db import get_supabase
-    sb = get_supabase()
-    sb.table("financings").update(
-        {"status": "funded", "fund_tx_hash": release.tx_hash}
-    ).eq("id", financing_id).execute()
+    if settings.chain_mock_mode:
+        # Mock mode: drive the full happy path so FE can demo without a chain.
+        from app.services.chain import get_chain_client
+        chain = get_chain_client()
+        release = await chain.release_milestone(financing_id, 1)
+        m1 = repos.get_milestone(financing_id, 1)
+        if m1:
+            repos.update_milestone(
+                m1["id"],
+                {"status": "released", "release_tx_hash": release.tx_hash},
+            )
 
-    return {"funding_id": funding["id"], "release_tx_hash": release.tx_hash}
+        sb.table("financings").update(
+            {"status": "funded", "fund_tx_hash": release.tx_hash}
+        ).eq("id", financing_id).execute()
+
+        return {"funding_id": funding["id"], "release_tx_hash": release.tx_hash}
+
+    # Real mode: the on-chain fundWithRef() tx (signed by the investor's wallet)
+    # is the source of truth. /agent/funded-webhook will set token_id +
+    # status=funded once Goldsky delivers the event. The agent loop will then
+    # auto-release M1 via the ProofSubmitted path for milestones >= 2.
+    return {
+        "funding_id": funding["id"],
+        "status": "awaiting_chain_confirmation",
+        "note": (
+            "Call FundingPool.fundWithRef(..., financingRef=keccak256(financing_id)) "
+            "on-chain via wagmi. The /agent/funded-webhook will record token_id "
+            "and flip status to funded once the event is indexed."
+        ),
+    }
 
 
 @router.post("/financing/{financing_id}/milestone-proof")
