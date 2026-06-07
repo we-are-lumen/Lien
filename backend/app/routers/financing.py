@@ -23,8 +23,6 @@ from app.core.auth import require_auth
 from app.core.errors import BadRequest, Conflict, NotFound
 from app.models import schemas
 from app.services import repos
-from app.services.ai_verifier import get_ai_verifier
-from app.services.chain import get_chain_client
 
 
 router = APIRouter()
@@ -255,7 +253,17 @@ async def upload_milestone_proof(
     milestone_idx: int = Query(..., ge=2, le=4, description="Milestone index 2-4 (M1 auto-releases on fund)"),
     address: str = Depends(require_auth),
 ) -> dict:
-    """Supplier uploads proof for a milestone. AI verifies → maybe release."""
+    """Supplier uploads proof to IPFS. Returns the CID.
+
+    After this returns, the FE must call ``FundingPool.submitProof(tokenId,
+    milestoneIdx, cid)`` on-chain via wagmi/viem. That emits ``ProofSubmitted``,
+    which Goldsky forwards to ``/agent/webhook``; the autonomous agent loop then
+    runs Claude Vision verification and calls ``releaseMilestone()`` on success.
+
+    This endpoint does NOT verify the proof or touch the chain. The agent loop
+    is the single authority on those steps. FE polls
+    ``GET /agent/decisions/{financing_id}`` to see the verdict.
+    """
     fin = repos.get_financing(financing_id)
     if not fin:
         raise NotFound("Financing not found")
@@ -265,62 +273,37 @@ async def upload_milestone_proof(
         raise NotFound(f"Milestone {milestone_idx} not found for this financing")
     if milestone["status"] == "released":
         raise Conflict("Milestone already released")
-    if milestone["retry_count"] >= 3:
-        raise Conflict("Milestone retry budget exhausted — escalated to manual review")
 
     file_bytes = await file.read()
+    if not file_bytes:
+        raise BadRequest("Empty file upload")
 
-    # Upload to IPFS first.
+    # Upload to IPFS (Pinata in real mode, deterministic mock in dev).
     from app.services.ipfs import get_ipfs_client
     ipfs = get_ipfs_client()
     upload = await ipfs.upload_bytes(file_bytes, file.filename or "proof.pdf")
 
-    # Verify via AI.
-    verifier = get_ai_verifier()
-    verdict = await verifier.verify_milestone(
-        file_bytes=file_bytes,
-        milestone_idx=milestone_idx,
-        product_type=fin["product_type"],
-        financing_meta={"amount": float(fin["amount"]), "due_date": fin["due_date"]},
-    )
-
-    if verdict.verdict == "APPROVED" and verdict.confidence >= 0.5:
-        chain = get_chain_client()
-        release = await chain.release_milestone(financing_id, milestone_idx)
-        repos.update_milestone(
-            milestone["id"],
-            {
-                "status": "released",
-                "proof_file_url": upload.url,
-                "proof_ipfs_cid": upload.cid,
-                "ai_verification": verdict.to_dict(),
-                "release_tx_hash": release.tx_hash,
-            },
-        )
-        return {
-            "milestone_id": milestone["id"],
-            "status": "released",
-            "confidence": verdict.confidence,
-            "release_tx_hash": release.tx_hash,
-        }
-
-    # Otherwise reject — increment retry and store verdict.
+    # Persist the CID on the milestone row so it survives FE refreshes between
+    # upload and the on-chain submitProof() call.
     repos.update_milestone(
         milestone["id"],
         {
-            "status": "rejected",
             "proof_file_url": upload.url,
             "proof_ipfs_cid": upload.cid,
-            "ai_verification": verdict.to_dict(),
-            "retry_count": milestone["retry_count"] + 1,
+            "status": "proof_uploaded",
         },
     )
+
     return {
         "milestone_id": milestone["id"],
-        "status": "rejected",
-        "confidence": verdict.confidence,
-        "fail_reasons": verdict.fail_reasons,
-        "message": verdict.display_message,
+        "cid": upload.cid,
+        "url": upload.url,
+        "status": "proof_uploaded",
+        "next_step": (
+            "Call FundingPool.submitProof(tokenId, milestoneIdx, cid) on-chain "
+            "to trigger AI verification. Poll /agent/decisions/{financing_id} "
+            "for the result."
+        ),
     }
 
 
