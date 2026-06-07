@@ -74,12 +74,15 @@ def _claim_next_pending() -> Optional[dict]:
     ).eq("status", "processing").lt("locked_at", stale_cutoff).lt("attempt_count", MAX_ATTEMPTS).execute()
 
     # Fetch the oldest pending item that hasn't exceeded max attempts.
+    # Order by updated_at (not created_at) so that requeued jobs go to the back
+    # of the line — the updated_at trigger bumps the timestamp on every requeue,
+    # naturally rotating an out-of-order job behind any newer pending work.
     rows = (
         sb.table("agent_queue")
         .select("*")
         .eq("status", "pending")
         .lt("attempt_count", MAX_ATTEMPTS)
-        .order("created_at", desc=False)
+        .order("updated_at", desc=False)
         .limit(1)
         .execute()
     )
@@ -501,13 +504,41 @@ async def _process_job(job: dict) -> None:
 
     except PriorMilestoneNotReleasedError as exc:
         # Out-of-order webhook — prior milestone not yet released on-chain.
-        # Reset to pending (decrement attempt_count so we don't burn retries) and
-        # let the loop pick it up again after the prior milestone clears.
+        # Reset to pending and clear attempt_count so we don't burn retries on
+        # a retriable condition. The loop picks it up again after the prior
+        # milestone clears.
+        #
+        # Roll back the milestone row: we set status=released BEFORE the chain
+        # call (deliberate, for crash recovery), but the chain call failed
+        # with a retriable error and release_tx_hash is still null. Leaving
+        # status='released' would lie to the FE — show "released" without the
+        # funds actually being disbursed. Set it back to proof_uploaded so the
+        # FE state matches reality until the retry succeeds.
+        try:
+            await asyncio.to_thread(_update_milestone_status, financing_id, milestone_idx, {
+                "status": "proof_uploaded",
+                "released_at": None,
+            })
+        except Exception as rollback_exc:
+            # Don't let a rollback failure block the requeue — the FE will see
+            # a transiently-incorrect status, but the requeue path must keep
+            # moving. Stale-lock recovery would otherwise take LOCK_TIMEOUT to
+            # unwedge this job.
+            log.warning(
+                "agent: job %s milestone rollback failed (will retry on next pickup): %s",
+                queue_id, rollback_exc,
+            )
         log.warning(
-            "agent: job %s PriorMilestoneNotReleased — re-queuing (attempt_count decremented)",
+            "agent: job %s PriorMilestoneNotReleased — re-queuing (attempt_count reset)",
             queue_id,
         )
         await asyncio.to_thread(_requeue_job, queue_id, str(exc))
+        # Brief delay to avoid tight-spinning when this is the only pending job.
+        # Order-by-updated_at in _claim_next_pending rotates it to the back of
+        # the queue, but with no sibling work the loop would pick it up again
+        # immediately and burn CPU + Supabase quota until the prior milestone
+        # finally arrives.
+        await asyncio.sleep(POLL_INTERVAL)
 
     except Exception as exc:
         log.exception("agent: job %s failed: %s", queue_id, exc)
