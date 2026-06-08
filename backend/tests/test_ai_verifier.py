@@ -164,6 +164,8 @@ def test_build_po_m2_prompt_75pct_cap():
     """PO M2 nominal cap is 75% (tighter than Invoice M2's 80%)."""
     inv_prompt, _ = _build_milestone_prompt(2, "invoice", _META)
     po_prompt, _ = _build_milestone_prompt(2, "po", _META)
+    # PO M2 must explicitly cap at 75%.
     assert "75%" in po_prompt
-    # Invoice M2 uses 80%; PO M2 uses 75% — they must differ.
-    assert "75%" not in inv_prompt or "80%" in inv_prompt
+    # Invoice M2 must use 80%, not 75%.
+    assert "80%" in inv_prompt
+    assert "75%" not in inv_prompt
