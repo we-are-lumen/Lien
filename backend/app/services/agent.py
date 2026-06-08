@@ -29,6 +29,7 @@ from app.services.chain import (
     MilestoneAlreadyReleasedError,
     PriorMilestoneNotReleasedError,
 )
+from app.services.freeze_default import check_and_apply_f1_freeze, is_frozen, run_auto_default_scan
 
 log = logging.getLogger(__name__)
 
@@ -304,6 +305,18 @@ async def _process_job(job: dict) -> None:
         queue_id, financing_id, milestone_idx,
     )
 
+    # F1 guard: if the financing is currently frozen (F1 retry-freeze applied),
+    # skip processing and re-queue the job to be picked up after the freeze window.
+    frozen, frozen_until = await asyncio.to_thread(is_frozen, financing_id)
+    if frozen:
+        log.warning(
+            "agent: job %s skipped — financing=%s is frozen until %s (F1 retry-freeze)",
+            queue_id, financing_id, frozen_until,
+        )
+        await asyncio.to_thread(_requeue_job, queue_id, f"Frozen until {frozen_until}")
+        await asyncio.sleep(POLL_INTERVAL)
+        return
+
     # M1 is auto-released by FundingPool.fund() at investor funding time.
     # The agent must never call releaseMilestone(tokenId, 1) — it would revert
     # with MilestoneAlreadyReleased. If a webhook arrives for M1 (e.g. replayed
@@ -470,6 +483,17 @@ async def _process_job(job: dict) -> None:
                 },
             })
 
+            # F1: check if 3 rejections occurred within 7 days (PRD §Milestone Retry Policy).
+            # Run AFTER writing the current decision so it counts in the window.
+            freeze_applied = await asyncio.to_thread(
+                check_and_apply_f1_freeze, financing_id, milestone_idx
+            )
+            if freeze_applied:
+                log.warning(
+                    "agent: F1 freeze applied — financing=%s milestone=%d will be frozen 48h",
+                    financing_id, milestone_idx,
+                )
+
         else:
             # APPROVED with confidence < 0.50 (model hedging), or any verdict
             # with confidence < 0.30 — escalate for human review.
@@ -632,3 +656,37 @@ async def agent_loop() -> None:
         except Exception as exc:
             log.exception("agent: unexpected error in loop: %s", exc)
             await asyncio.sleep(POLL_INTERVAL)
+
+
+# B1 auto-default interval: run once per day (86400 seconds).
+_B1_INTERVAL_SECONDS = 86_400
+
+
+async def auto_default_loop() -> None:
+    """B1: nightly background task that scans for overdue financings and marks them
+    defaulted on-chain + in DB.
+
+    PRD v3.0 §Default Conditions:
+        Financing overdue by more than 44 calendar days → automatically defaulted.
+
+    Runs once at startup (to catch anything missed during downtime) and then
+    every 24 hours thereafter.
+    """
+    log.info("agent: B1 auto-default loop started")
+    while True:
+        try:
+            defaulted = await asyncio.to_thread(run_auto_default_scan)
+            if defaulted:
+                log.warning(
+                    "agent: B1 auto-default run complete — defaulted %d financing(s): %s",
+                    len(defaulted), defaulted,
+                )
+            else:
+                log.info("agent: B1 auto-default run complete — no overdue financings")
+        except asyncio.CancelledError:
+            log.info("agent: B1 auto-default loop shutting down")
+            break
+        except Exception as exc:
+            log.exception("agent: B1 auto-default loop error: %s", exc)
+
+        await asyncio.sleep(_B1_INTERVAL_SECONDS)
