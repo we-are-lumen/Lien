@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 ProductType = Literal["invoice", "po"]
 RiskTier = Literal["low", "medium", "high", "reject"]
@@ -27,6 +27,29 @@ YIELD_TABLE = {
 
 # Advance rate by tier (PO only; invoice always 100%)
 PO_ADVANCE_BY_TIER = {"low": 80, "medium": 75, "high": 70}
+
+# ---------------------------------------------------------------------------
+# Pool caps per risk tier + product type (PRD v3.0 §Risk Tiers — Pool Caps)
+#
+# Maximum single-financing exposure the platform will deploy per deal:
+#   Low risk      -> no cap (unlimited)
+#   Medium invoice -> USD 10,000
+#   Medium PO     -> USD 7,500  (riskier collateral)
+#   High (both)   -> USD 5,000
+#
+# Cap is checked against funding_amount (post-advance-rate haircut),
+# i.e. actual cash deployed, not the face nominal.
+# None = no cap.
+# ---------------------------------------------------------------------------
+
+POOL_CAP: dict[tuple[str, str], Optional[Decimal]] = {
+    ("invoice", "low"):    None,
+    ("invoice", "medium"): Decimal("10000"),
+    ("invoice", "high"):   Decimal("5000"),
+    ("po", "low"):         None,
+    ("po", "medium"):      Decimal("7500"),
+    ("po", "high"):        Decimal("5000"),
+}
 
 ORIGINATION_FEE_BPS = 150       # 1.5%
 PERFORMANCE_FEE_BPS = 1000      # 10%
@@ -60,6 +83,16 @@ def advance_rate_for(product_type: ProductType, tier: RiskTier) -> int:
     if tier == "reject":
         return 0
     return PO_ADVANCE_BY_TIER[tier]
+
+
+def pool_cap_for(product_type: str, tier: str) -> Optional[Decimal]:
+    """Return the pool cap for the given (product_type, tier) combination.
+
+    Returns None if there is no cap (low risk).
+    Raises KeyError for unknown combinations — callers should guard against
+    reject tier before calling this.
+    """
+    return POOL_CAP[(product_type, tier)]
 
 
 def price(
