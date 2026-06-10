@@ -9,9 +9,18 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@mantine/charts": "^9.3.1",
+    "@mantine/core": "^9.3.1",
+    "@mantine/dates": "^9.3.1",
+    "@mantine/form": "^9.3.1",
+    "@mantine/hooks": "^9.3.1",
+    "@mantine/modals": "^9.3.1",
+    "@mantine/notifications": "^9.3.1",
+    "dayjs": "^1.11.21",
     "next": "16.2.9",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "recharts": "^3.8.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -20,6 +29,9 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
+    "postcss": "^8.5.15",
+    "postcss-preset-mantine": "^1.18.0",
+    "postcss-simple-vars": "^7.0.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
