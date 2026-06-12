@@ -20,20 +20,22 @@ from app.routers import documents as documents_router
 from app.routers import financing as financing_router
 from app.routers import health as health_router
 from app.routers import stats as stats_router
-from app.services.agent import agent_loop
+from app.services.agent import agent_loop, auto_default_loop
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    task = asyncio.create_task(agent_loop())
+    agent_task = asyncio.create_task(agent_loop())
+    default_task = asyncio.create_task(auto_default_loop())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for task in (agent_task, default_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def create_app() -> FastAPI:

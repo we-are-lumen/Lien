@@ -148,6 +148,17 @@ class ChainClient:
         needs to reconstruct the original tx_hash. Default: not implemented."""
         raise NotImplementedError
 
+    async def mark_defaulted(self, financing_id: str) -> ChainResult:
+        """B1: mark a financing token as defaulted on-chain.
+
+        Called by the nightly auto-default cron when due_date + 44 days has
+        passed without full repayment. Emits an on-chain event for indexers and
+        freezes further milestone releases on the smart contract side.
+
+        The contract function is FundingPool.markDefaulted(tokenId).
+        """
+        raise NotImplementedError
+
 
 # ---------------------------------------------------------------------------
 # Mock (deterministic, no network)
@@ -194,6 +205,10 @@ class MockChainClient(ChainClient):
     ) -> Optional[ChainResult]:
         # Mock: deterministic recovery — return the same tx_hash release_milestone would.
         return ChainResult(tx_hash=_mock_tx(f"release:{financing_id}:{milestone_idx}"))
+
+    async def mark_defaulted(self, financing_id: str) -> ChainResult:
+        """Mock: return deterministic tx_hash for auto-default. No state change needed."""
+        return ChainResult(tx_hash=_mock_tx(f"default:{financing_id}"))
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +435,37 @@ class MantleChainClient(ChainClient):
             tx_hash=latest["transactionHash"].hex(),
             block_number=latest["blockNumber"],
         )
+
+    async def mark_defaulted(self, financing_id: str) -> ChainResult:
+        """B1: call FundingPool.markDefaulted(tokenId) on-chain.
+
+        Looks up the financing's token_id from DB, then broadcasts the tx.
+        The contract must emit a FinancingDefaulted event that Goldsky indexes.
+        """
+        from app.core.db import get_supabase
+        import asyncio as _asyncio
+
+        def _lookup_token_id() -> Optional[int]:
+            rows = (
+                get_supabase()
+                .table("financings")
+                .select("token_id")
+                .eq("id", financing_id)
+                .limit(1)
+                .execute()
+            )
+            if not rows.data or not rows.data[0].get("token_id"):  # type: ignore[union-attr]
+                return None
+            return int(rows.data[0]["token_id"])  # type: ignore[index]
+
+        token_id = await _asyncio.to_thread(_lookup_token_id)
+        if token_id is None:
+            raise ValueError(
+                f"Cannot mark_defaulted: financing {financing_id} has no token_id"
+            )
+
+        fn = self._pool.functions.markDefaulted(token_id)
+        return await self._send(fn)
 
 
 # ---------------------------------------------------------------------------
