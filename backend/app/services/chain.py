@@ -140,6 +140,19 @@ class ChainClient:
     async def release_milestone(self, financing_id: str, milestone_idx: int) -> ChainResult:
         raise NotImplementedError
 
+    async def fund(self, financing_id: str) -> str:
+        """Mock-only helper: simulate the investor's on-chain `fund()` tx that
+        atomically deposits USDT0 and auto-releases M1 to the supplier.
+
+        Returns the deterministic tx_hash representing this combined operation.
+
+        In real (Mantle) mode, the investor signs and broadcasts `fund()` from
+        their own wallet via wagmi — the BE never sends this tx. The real
+        client raises NotImplementedError to make accidental BE-side calls fail
+        loudly instead of double-paying gas or stalling.
+        """
+        raise NotImplementedError
+
     async def find_milestone_released_tx(
         self, financing_id: str, milestone_idx: int
     ) -> Optional[ChainResult]:
@@ -199,6 +212,14 @@ class MockChainClient(ChainClient):
 
     async def release_milestone(self, financing_id: str, milestone_idx: int) -> ChainResult:
         return ChainResult(tx_hash=_mock_tx(f"release:{financing_id}:{milestone_idx}"))
+
+    async def fund(self, financing_id: str) -> str:
+        """Mock the investor's fund() tx — atomic deposit + auto-release of M1.
+
+        The single tx_hash returned represents both the USDT0 deposit and the
+        M1 release (mirrors FundingPool.fund's behaviour at FundingPool.sol:155).
+        """
+        return _mock_tx(f"fund:{financing_id}")
 
     async def find_milestone_released_tx(
         self, financing_id: str, milestone_idx: int

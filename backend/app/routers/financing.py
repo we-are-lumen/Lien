@@ -202,9 +202,20 @@ async def fund_financing(
     """Investor funds a financing.
 
     In the real flow the investor signs the on-chain `fund()` tx directly
-    via wagmi. This endpoint exists for the BE to record the bookkeeping
-    after the tx confirms, OR (in mock mode) to simulate the funding flow
-    end-to-end without a chain.
+    via wagmi, which inside the same tx auto-releases M1 to the supplier
+    (FundingPool.fund → _releaseMilestone(tokenId, 1) at FundingPool.sol:155).
+    This endpoint exists for the BE to record the bookkeeping after the tx
+    confirms, OR (in mock mode) to simulate the funding flow end-to-end
+    without a chain.
+
+    DO NOT call `chain.release_milestone(_, 1)` from here — in real mode it
+    reverts `MilestoneAlreadyReleased` because FundingPool.fund already did
+    the M1 release inside the investor's tx. Both M1 release and the fund
+    deposit share the same tx_hash.
+
+    In real mode the actual fund_tx_hash is supplied by the FE (the wagmi
+    tx receipt) via a future `tx_hash` body param; for mock mode we mint a
+    deterministic hash here.
     """
     fin = repos.get_financing(financing_id)
     if not fin:
@@ -225,25 +236,41 @@ async def fund_financing(
         }
     )
 
-    # Auto-release M1 (always idx=1, auto=true) and flip status.
+    # Resolve fund_tx_hash. In mock mode, mint a deterministic tx_hash that
+    # represents the (atomic) fund + M1 release transaction. In real mode,
+    # this endpoint currently runs AFTER the investor's wagmi tx confirms,
+    # so we must NOT broadcast our own tx — the FE will send the real
+    # tx_hash in a follow-up patch. Until then we tag with a placeholder so
+    # the row isn't null.
     from app.services.chain import get_chain_client
+    from app.core.config import get_settings
     chain = get_chain_client()
-    release = await chain.release_milestone(financing_id, 1)
+    settings = get_settings()
+    if settings.chain_mock_mode:
+        # Mock: simulate the atomic fund-and-release tx_hash.
+        fund_tx_hash = await chain.fund(financing_id)
+    else:
+        # Real: investor's wagmi tx already confirmed. FE must supply the
+        # real fund tx_hash; for now mark it as pending so the row is
+        # populated but identifiable as awaiting reconciliation.
+        fund_tx_hash = "0xpending-fe-tx-hash"
+
+    # Mark M1 released — same tx_hash as fund (atomic on-chain).
     m1 = repos.get_milestone(financing_id, 1)
     if m1:
         repos.update_milestone(
             m1["id"],
-            {"status": "released", "release_tx_hash": release.tx_hash},
+            {"status": "released", "release_tx_hash": fund_tx_hash},
         )
 
     # Flip financing status.
     from app.core.db import get_supabase
     sb = get_supabase()
     sb.table("financings").update(
-        {"status": "funded", "fund_tx_hash": release.tx_hash}
+        {"status": "funded", "fund_tx_hash": fund_tx_hash}
     ).eq("id", financing_id).execute()
 
-    return {"funding_id": funding["id"], "release_tx_hash": release.tx_hash}
+    return {"funding_id": funding["id"], "fund_tx_hash": fund_tx_hash}
 
 
 @router.post("/financing/{financing_id}/milestone-proof")
