@@ -17,7 +17,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
+from pydantic import BaseModel, Field
 
 from app.core.auth import require_auth
 from app.core.errors import BadRequest, Conflict, NotFound
@@ -194,28 +195,56 @@ async def get_financing_report(financing_id: str) -> dict:
     }
 
 
+class FundFinancingBody(BaseModel):
+    """Optional body for /financing/{id}/fund.
+
+    In real Mantle mode, the FE must supply ``tx_hash`` — the wagmi receipt
+    hash from the investor's on-chain ``FundingPool.fund()`` call. The
+    Goldsky ``Funded`` event handler later matches this hash to write
+    ``financings.token_id``. Without it, the off-chain UUID never gets
+    linked to the on-chain token and the agent loop can't resolve
+    ProofSubmitted webhooks.
+
+    In mock mode this field is ignored — the BE mints a deterministic
+    tx_hash via ``MockChainClient.fund()``.
+    """
+    tx_hash: Optional[str] = Field(
+        default=None,
+        min_length=66,
+        max_length=66,
+        description="On-chain fund tx_hash (0x + 64 hex). Required in real mode.",
+    )
+
+
 @router.post("/financing/{financing_id}/fund")
 async def fund_financing(
     financing_id: str,
+    body: Optional[FundFinancingBody] = Body(default=None),
     address: str = Depends(require_auth),
 ) -> dict:
     """Investor funds a financing.
 
-    In the real flow the investor signs the on-chain `fund()` tx directly
+    In the real flow the investor signs the on-chain ``fund()`` tx directly
     via wagmi, which inside the same tx auto-releases M1 to the supplier
-    (FundingPool.fund → _releaseMilestone(tokenId, 1) at FundingPool.sol:155).
-    This endpoint exists for the BE to record the bookkeeping after the tx
-    confirms, OR (in mock mode) to simulate the funding flow end-to-end
-    without a chain.
+    (``FundingPool.fund → _releaseMilestone(tokenId, 1)`` at
+    contracts/src/FundingPool.sol:155). This endpoint exists for the BE to
+    record the bookkeeping after the tx confirms, OR (in mock mode) to
+    simulate the funding flow end-to-end without a chain.
 
-    DO NOT call `chain.release_milestone(_, 1)` from here — in real mode it
-    reverts `MilestoneAlreadyReleased` because FundingPool.fund already did
-    the M1 release inside the investor's tx. Both M1 release and the fund
-    deposit share the same tx_hash.
+    DO NOT call ``chain.release_milestone(_, 1)`` from here — in real mode
+    it reverts ``MilestoneAlreadyReleased`` because ``FundingPool.fund``
+    already did the M1 release inside the investor's tx. Both M1 release
+    and the fund deposit share the same tx_hash.
 
-    In real mode the actual fund_tx_hash is supplied by the FE (the wagmi
-    tx receipt) via a future `tx_hash` body param; for mock mode we mint a
-    deterministic hash here.
+    Modes:
+      - ``chain_mock_mode=True`` (local/dev): the BE mints a deterministic
+        ``fund_tx_hash`` via ``MockChainClient.fund(financing_id)``. Body
+        ``tx_hash`` is ignored.
+      - ``chain_mock_mode=False`` (real Mantle): the FE must supply the
+        wagmi receipt ``tx_hash`` in the body. The Goldsky ``Funded`` event
+        handler later matches this hash to write ``financings.token_id``.
+        Missing ``tx_hash`` raises 400 — without it the off-chain UUID
+        never gets linked to the on-chain token.
     """
     fin = repos.get_financing(financing_id)
     if not fin:
@@ -236,24 +265,22 @@ async def fund_financing(
         }
     )
 
-    # Resolve fund_tx_hash. In mock mode, mint a deterministic tx_hash that
-    # represents the (atomic) fund + M1 release transaction. In real mode,
-    # this endpoint currently runs AFTER the investor's wagmi tx confirms,
-    # so we must NOT broadcast our own tx — the FE will send the real
-    # tx_hash in a follow-up patch. Until then we tag with a placeholder so
-    # the row isn't null.
+    # Resolve fund_tx_hash by mode.
     from app.services.chain import get_chain_client
     from app.core.config import get_settings
     chain = get_chain_client()
     settings = get_settings()
     if settings.chain_mock_mode:
-        # Mock: simulate the atomic fund-and-release tx_hash.
         fund_tx_hash = await chain.fund(financing_id)
     else:
-        # Real: investor's wagmi tx already confirmed. FE must supply the
-        # real fund tx_hash; for now mark it as pending so the row is
-        # populated but identifiable as awaiting reconciliation.
-        fund_tx_hash = "0xpending-fe-tx-hash"
+        # Real Mantle: require the FE-supplied receipt hash so the Goldsky
+        # Funded handler can later resolve token_id by matching this value.
+        if body is None or not body.tx_hash:
+            raise BadRequest(
+                "tx_hash required in real chain mode — supply the wagmi "
+                "receipt hash from the investor's FundingPool.fund() tx."
+            )
+        fund_tx_hash = body.tx_hash
 
     # Mark M1 released — same tx_hash as fund (atomic on-chain).
     m1 = repos.get_milestone(financing_id, 1)
