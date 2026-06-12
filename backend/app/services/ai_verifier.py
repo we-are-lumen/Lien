@@ -159,16 +159,64 @@ class MockAIVerifier(AIVerifier):
         confidence_int = _deterministic_score(seed, low=75, high=98)
         confidence = confidence_int / 100.0
         verdict = "APPROVED" if confidence >= 0.5 else "REJECTED"
+
+        # Return the same check-key names the real Claude verifier uses so tests
+        # can validate the response schema without making actual API calls.
+        checks: dict
+        pt = str(product_type)
+        if pt == "invoice" and milestone_idx == 2:
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock"},
+                "supplier_name_match": {"pass": True, "note": "mock fuzzy 94%"},
+                "nominal_proportional": {"pass": True, "note": "mock within 20-80%"},
+                "date_valid": {"pass": True, "note": "mock"},
+                "sub_vendor_identifiable": {"pass": True, "note": "mock"},
+                "anomaly_count_acceptable": {"pass": True, "note": "mock"},
+            }
+        elif pt == "invoice" and milestone_idx == 3:
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock surat jalan"},
+                "buyer_name_match": {"pass": True, "note": "mock fuzzy 91%"},
+                "delivery_consistent_with_invoice": {"pass": True, "note": "mock 80%"},
+                "quantity_not_exceeded": {"pass": True, "note": "mock"},
+                "timeline_valid": {"pass": True, "note": "mock within due+14d"},
+            }
+        elif pt == "po" and milestone_idx == 2:
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock"},
+                "supplier_name_match": {"pass": True, "note": "mock fuzzy 94%"},
+                "nominal_proportional": {"pass": True, "note": "mock within 20-75%"},
+                "date_valid": {"pass": True, "note": "mock"},
+                "sub_vendor_identifiable": {"pass": True, "note": "mock"},
+                "anomaly_count_acceptable": {"pass": True, "note": "mock"},
+            }
+        elif pt == "po" and milestone_idx == 3:
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock qc report"},
+                "production_evidence_visible": {"pass": True, "note": "mock"},
+                "exif_consistency": {"pass": True, "note": "mock"},
+                "visual_manipulation_check": {"pass": True, "note": "mock"},
+                "supplier_context_match": {"pass": True, "note": "mock"},
+            }
+        elif pt == "po" and milestone_idx == 4:
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock surat jalan"},
+                "buyer_signature_present": {"pass": True, "note": "mock stamp found"},
+                "buyer_name_match": {"pass": True, "note": "mock fuzzy 88%"},
+                "quantity_consistent_with_production": {"pass": True, "note": "mock within 5%"},
+                "timeline_valid": {"pass": True, "note": "mock"},
+            }
+        else:
+            # M1 fallback or unknown milestone.
+            checks = {
+                "doc_type_valid": {"pass": True, "note": "mock"},
+                "doc_authenticity": {"pass": True, "note": "mock"},
+            }
+
         return MilestoneVerifyResult(
             confidence=confidence,
             verdict=verdict,
-            checks={
-                "doc_type_valid": {"pass": True, "note": "mock"},
-                "supplier_name_match": {"pass": True, "note": "mock fuzzy 94%"},
-                "nominal_proportional": {"pass": True, "note": "mock"},
-                "date_valid": {"pass": True, "note": "mock"},
-                "doc_authenticity": {"pass": True, "note": "mock"},
-            },
+            checks=checks,
             fail_reasons=[],
             display_message=f"Mock verification for milestone {milestone_idx}: {verdict}",
         )
@@ -187,6 +235,289 @@ _MILESTONE_SYSTEM_PROMPT = (
     "genuinely demonstrates completion of a specific milestone in a trade "
     "financing transaction. Be strict but fair. Return ONLY valid JSON."
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-milestone prompt specialization (PRD v3.0 §Milestone Details)
+#
+# Each tuple is (checks_description, response_schema) where checks_description
+# lists the exact checks Claude must run and response_schema names the JSON keys.
+#
+# Invoice milestones:
+#   M1 — auto on funding, never uploaded; M2 — sub-vendor purchase invoice;
+#   M3 — Surat Jalan / BAST delivery proof.
+#
+# PO milestones:
+#   M1 — auto on funding, never uploaded; M2 — sub-vendor purchase invoice;
+#   M3 — QC report / production photos; M4 — Surat Jalan/BAST with buyer signature.
+# ---------------------------------------------------------------------------
+
+
+def _build_milestone_prompt(
+    milestone_idx: int,
+    product_type: str,
+    financing_meta: dict,
+) -> tuple[str, str]:
+    """Return (user_prompt, schema_hint) tailored to the specific milestone.
+
+    M1 is never uploaded (auto-released on funding) — the agent loop short-
+    circuits it. This builder is only called for M2+ in practice, but handles
+    M1 as a fallback.
+    """
+    supplier = financing_meta.get("issuer_name", "N/A")
+    buyer = financing_meta.get("buyer_name", "N/A")
+    total_amount = financing_meta.get("total_amount", "N/A")
+    due_date = financing_meta.get("due_date", "N/A")
+
+    # Common JSON output schema shared by all milestones. Specific milestones
+    # override individual check names but keep the same envelope.
+    _BASE_SCHEMA = (
+        "Return ONLY a JSON object with this exact schema:\n"
+        "{\n"
+        '  "verdict": "APPROVED" | "REJECTED",\n'
+        '  "confidence": 0.0-1.0,\n'
+        '  "checks": { <check_name>: {"pass": true/false, "note": "..."}, ... },\n'
+        '  "fail_reasons": ["..."],\n'
+        '  "display_message": "One sentence summary for the supplier."\n'
+        "}\n\n"
+        "Confidence scoring (based on check passes):\n"
+        "- all checks pass -> confidence 0.85-0.99\n"
+        "- one check fails -> 0.65-0.84\n"
+        "- two checks fail -> 0.40-0.64\n"
+        "- three or more fail -> 0.10-0.39\n\n"
+        "Set verdict to APPROVED only when you are genuinely confident the "
+        "milestone is proven. When in doubt, REJECT and explain why."
+    )
+
+    if product_type == "invoice":
+        return _invoice_milestone_prompt(
+            milestone_idx, supplier, buyer, total_amount, due_date, _BASE_SCHEMA
+        )
+    return _po_milestone_prompt(
+        milestone_idx, supplier, buyer, total_amount, due_date, _BASE_SCHEMA
+    )
+
+
+def _invoice_milestone_prompt(
+    milestone_idx: int,
+    supplier: str,
+    buyer: str,
+    total_amount: str,
+    due_date: str,
+    schema: str,
+) -> tuple[str, str]:
+    """Invoice-specific prompts for M2 and M3 (M1 is auto)."""
+
+    if milestone_idx == 2:
+        # Invoice M2: sub-vendor purchase invoice for raw materials.
+        # PRD: doc type = PURCHASE invoice, supplier name fuzzy ≥80%,
+        #       nominal 20–80% of parent, date valid, sub-vendor identifiable,
+        #       ≤1 minor anomaly flag.
+        checks_text = (
+            "Run these six checks, each with a pass boolean and a short note:\n"
+            "- doc_type_valid: the document is a PURCHASE invoice (sub-vendor billing supplier "
+            "for raw materials). A sales invoice from supplier to buyer is the WRONG type.\n"
+            f"- supplier_name_match: the supplier/consignee name on the document matches "
+            f'"{supplier}" with at least 80% fuzzy similarity (typos, abbreviations OK).\n'
+            f"- nominal_proportional: the amount shown is between 20% and 80% of the parent "
+            f"financing amount {total_amount}. Amount exactly equal to {total_amount} is suspicious.\n"
+            "- date_valid: the invoice date is present and logically before or on the due date "
+            f"{due_date}. Future dates or dates after {due_date} are invalid.\n"
+            "- sub_vendor_identifiable: a sub-vendor / issuing company name is clearly shown "
+            "on the document (separate from the financing supplier).\n"
+            "- anomaly_count_acceptable: the document has at most 1 minor visual anomaly "
+            "(minor = misalignment, light smudge). Any heavy anomaly (erasure, inconsistent font, "
+            "digital alteration) → fail.\n\n"
+            "Use check keys exactly: doc_type_valid, supplier_name_match, nominal_proportional, "
+            "date_valid, sub_vendor_identifiable, anomaly_count_acceptable.\n\n"
+        )
+        context = (
+            f"Financing context:\n"
+            f"  Product type: Invoice financing\n"
+            f"  Milestone: M2 — sub-vendor purchase invoice for raw materials\n"
+            f"  Supplier name: {supplier}\n"
+            f"  Buyer name: {buyer}\n"
+            f"  Parent financing amount: {total_amount}\n"
+            f"  Financing due date: {due_date}\n\n"
+        )
+        return context + checks_text + schema, "invoice_m2"
+
+    if milestone_idx == 3:
+        # Invoice M3: Surat Jalan / BAST (delivery proof).
+        # PRD: doc type = delivery proof, buyer name fuzzy ≥80%,
+        #       semantic similarity to invoice ≥60%, quantity ≤ invoice,
+        #       timeline within due+14d grace, zero heavy anomaly flags.
+        checks_text = (
+            "Run these five checks, each with a pass boolean and a short note:\n"
+            "- doc_type_valid: the document is a delivery proof — Surat Jalan (delivery order), "
+            "BAST (handover certificate), or equivalent. A purchase invoice is the WRONG type.\n"
+            f"- buyer_name_match: the buyer/recipient name on the document matches "
+            f'"{buyer}" with at least 80% fuzzy similarity.\n'
+            "- delivery_consistent_with_invoice: the goods description, quantity, and reference "
+            "numbers are semantically consistent with the underlying trade (≥60% alignment). "
+            "Completely unrelated goods are a hard fail.\n"
+            "- quantity_not_exceeded: the delivered quantity is less than or equal to the "
+            "quantity on the parent invoice. Quantity exceeding the invoice is a fail.\n"
+            f"- timeline_valid: the delivery date is on or before {due_date} + 14 calendar days "
+            "(grace period). A delivery dated more than 14 days after the financing due date is invalid. "
+            "Zero heavy anomaly flags (erasure, digital manipulation, forged stamps) — any heavy "
+            "anomaly fails this check.\n\n"
+            "Use check keys exactly: doc_type_valid, buyer_name_match, "
+            "delivery_consistent_with_invoice, quantity_not_exceeded, timeline_valid.\n\n"
+        )
+        context = (
+            f"Financing context:\n"
+            f"  Product type: Invoice financing\n"
+            f"  Milestone: M3 — Surat Jalan / BAST delivery proof\n"
+            f"  Supplier name: {supplier}\n"
+            f"  Buyer name: {buyer}\n"
+            f"  Parent financing amount: {total_amount}\n"
+            f"  Financing due date: {due_date}\n\n"
+        )
+        return context + checks_text + schema, "invoice_m3"
+
+    # M1 fallback (should never be called in production — M1 is auto-released).
+    context = (
+        f"Financing context:\n"
+        f"  Product type: Invoice financing\n"
+        f"  Milestone: M1 — auto-released on funding (should not require manual upload)\n"
+        f"  Supplier name: {supplier}\n"
+        f"  Buyer name: {buyer}\n\n"
+    )
+    checks_text = (
+        "Run these two checks:\n"
+        "- doc_type_valid: the document relates to initial purchase order / contract signing.\n"
+        "- doc_authenticity: the document appears genuine and untampered.\n\n"
+        "Use check keys: doc_type_valid, doc_authenticity.\n\n"
+    )
+    return context + checks_text + schema, "invoice_m1_fallback"
+
+
+def _po_milestone_prompt(
+    milestone_idx: int,
+    supplier: str,
+    buyer: str,
+    total_amount: str,
+    due_date: str,
+    schema: str,
+) -> tuple[str, str]:
+    """PO-specific prompts for M2, M3, M4 (M1 is auto)."""
+
+    if milestone_idx == 2:
+        # PO M2: invoice for raw material purchase.
+        # PRD: same checks as Invoice M2 but nominal 20–75% of PO value.
+        checks_text = (
+            "Run these six checks, each with a pass boolean and a short note:\n"
+            "- doc_type_valid: the document is a PURCHASE invoice (sub-vendor billing supplier "
+            "for raw materials). A sales invoice or PO confirmation from the buyer is the WRONG type.\n"
+            f"- supplier_name_match: the supplier/consignee name matches "
+            f'"{supplier}" with at least 80% fuzzy similarity.\n'
+            f"- nominal_proportional: the amount shown is between 20% and 75% of the PO financing "
+            f"amount {total_amount}. Amount exceeding 75% of {total_amount} is disproportionate.\n"
+            "- date_valid: the invoice date is present and logically consistent with the PO timeline "
+            f"(on or before {due_date}).\n"
+            "- sub_vendor_identifiable: a sub-vendor / issuing company name is clearly shown "
+            "(separate from the financing supplier).\n"
+            "- anomaly_count_acceptable: at most 1 minor visual anomaly; zero heavy anomalies "
+            "(erasure, font inconsistency, digital alteration).\n\n"
+            "Use check keys exactly: doc_type_valid, supplier_name_match, nominal_proportional, "
+            "date_valid, sub_vendor_identifiable, anomaly_count_acceptable.\n\n"
+        )
+        context = (
+            f"Financing context:\n"
+            f"  Product type: PO financing\n"
+            f"  Milestone: M2 — purchase invoice from sub-vendor for raw materials\n"
+            f"  Supplier name: {supplier}\n"
+            f"  Buyer name: {buyer}\n"
+            f"  PO financing amount: {total_amount}\n"
+            f"  Financing due date: {due_date}\n\n"
+        )
+        return context + checks_text + schema, "po_m2"
+
+    if milestone_idx == 3:
+        # PO M3: QC report / production photos / berita acara.
+        # PRD: AI Vision checks photo metadata, EXIF consistency, visual manipulation detection.
+        checks_text = (
+            "Run these five checks, each with a pass boolean and a short note:\n"
+            "- doc_type_valid: the document is a quality control (QC) report, berita acara "
+            "(inspection certificate), or production photos. A delivery receipt, invoice, or "
+            "unrelated document is the WRONG type.\n"
+            "- production_evidence_visible: the document/photos show concrete production "
+            "evidence — goods being manufactured, assembly in progress, or finished items "
+            "ready for shipment. Generic office photos or irrelevant scenes are a fail.\n"
+            "- exif_consistency: for photos, check visual EXIF consistency — timestamps visible "
+            "in the image (e.g. camera overlay), metadata watermarks, or image properties "
+            "consistent with real production photography. Signs of digital insertion or "
+            "screenshot-of-screenshot artifacts are a fail.\n"
+            "- visual_manipulation_check: detect visual manipulation — inconsistent lighting, "
+            "copy-pasted elements, mismatched shadows, compression artifacts around objects "
+            "suggesting digital editing. Any heavy manipulation evidence fails.\n"
+            f"- supplier_context_match: the supplier/company name ({supplier}) or their "
+            "facility, products, or branding appears somewhere in the document/photos, "
+            "establishing traceability to this specific financing.\n\n"
+            "Use check keys exactly: doc_type_valid, production_evidence_visible, "
+            "exif_consistency, visual_manipulation_check, supplier_context_match.\n\n"
+        )
+        context = (
+            f"Financing context:\n"
+            f"  Product type: PO financing\n"
+            f"  Milestone: M3 — QC report / production photos / berita acara\n"
+            f"  Supplier name: {supplier}\n"
+            f"  Buyer name: {buyer}\n"
+            f"  PO financing amount: {total_amount}\n"
+            f"  Financing due date: {due_date}\n\n"
+        )
+        return context + checks_text + schema, "po_m3"
+
+    if milestone_idx == 4:
+        # PO M4: Surat Jalan / BAST signed by buyer (final delivery).
+        # PRD: buyer signature/stamp detected, fuzzy match ≥80%, quantity matches M3 within 5%,
+        #       timeline ≥M3 and ≤delivery+14d.
+        checks_text = (
+            "Run these five checks, each with a pass boolean and a short note:\n"
+            "- doc_type_valid: the document is a Surat Jalan (delivery order) or BAST "
+            "(handover certificate) representing final goods delivery. An invoice or QC report "
+            "is the WRONG type.\n"
+            f"- buyer_signature_present: a buyer signature, rubber stamp, or official mark "
+            f'from "{buyer}" (or their representative) is visibly present on the document. '
+            "An unsigned/unstamped delivery note is not accepted.\n"
+            f"- buyer_name_match: the buyer/recipient name on the document matches "
+            f'"{buyer}" with at least 80% fuzzy similarity.\n'
+            "- quantity_consistent_with_production: the delivered quantity is consistent with "
+            "what was produced in M3 (within 5% tolerance). A sudden quantity discrepancy "
+            "between production and delivery is suspicious.\n"
+            f"- timeline_valid: the delivery date is after the production milestone date "
+            f"and on or before {due_date} + 14 calendar days. Delivery before production or "
+            "more than 14 days after the financing due date is invalid.\n\n"
+            "Use check keys exactly: doc_type_valid, buyer_signature_present, buyer_name_match, "
+            "quantity_consistent_with_production, timeline_valid.\n\n"
+        )
+        context = (
+            f"Financing context:\n"
+            f"  Product type: PO financing\n"
+            f"  Milestone: M4 — Surat Jalan / BAST final delivery with buyer signature\n"
+            f"  Supplier name: {supplier}\n"
+            f"  Buyer name: {buyer}\n"
+            f"  PO financing amount: {total_amount}\n"
+            f"  Financing due date: {due_date}\n\n"
+        )
+        return context + checks_text + schema, "po_m4"
+
+    # M1 fallback.
+    context = (
+        f"Financing context:\n"
+        f"  Product type: PO financing\n"
+        f"  Milestone: M1 — auto-released on funding (should not require manual upload)\n"
+        f"  Supplier name: {supplier}\n"
+        f"  Buyer name: {buyer}\n\n"
+    )
+    checks_text = (
+        "Run these two checks:\n"
+        "- doc_type_valid: the document relates to the initial purchase order or contract.\n"
+        "- doc_authenticity: the document appears genuine and untampered.\n\n"
+        "Use check keys: doc_type_valid, doc_authenticity.\n\n"
+    )
+    return context + checks_text + schema, "po_m1_fallback"
 
 _DOCUMENT_SYSTEM_PROMPT = (
     "You are a financial document verifier for an invoice financing platform "
@@ -279,45 +610,13 @@ class ClaudeAIVerifier(AIVerifier):
         product_type: DocumentType,
         financing_meta: dict,
     ) -> MilestoneVerifyResult:
-        milestone_desc = _MILESTONE_DESCRIPTIONS.get(
-            milestone_idx, f"Milestone {milestone_idx}"
-        )
-        prompt = (
-            f"Verify this proof document for a milestone in a {product_type} "
-            "financing transaction.\n\n"
-            f"Milestone to prove: {milestone_desc}\n"
-            f"Supplier (issuer) name: {financing_meta.get('issuer_name', 'N/A')}\n"
-            f"Buyer name: {financing_meta.get('buyer_name', 'N/A')}\n"
-            f"Expected total amount: {financing_meta.get('total_amount', 'N/A')}\n"
-            f"Due date: {financing_meta.get('due_date', 'N/A')}\n\n"
-            "Run these five checks, each with a pass boolean and a short note:\n"
-            "- doc_type_valid: the document type matches what this milestone needs.\n"
-            "- supplier_name_match: the supplier name appears and matches.\n"
-            "- nominal_proportional: any amount shown is proportional/consistent "
-            "with the expected total.\n"
-            "- date_valid: dates are present and consistent with the due date.\n"
-            "- doc_authenticity: the document looks genuine, not tampered.\n\n"
-            "Confidence scoring rule based on how many of the 5 checks pass:\n"
-            "- all 5 pass -> confidence 0.85-0.99\n"
-            "- 4/5 pass -> 0.65-0.84\n"
-            "- 3/5 pass -> 0.40-0.64\n"
-            "- fewer than 3 pass -> 0.10-0.39\n\n"
-            "Set verdict to APPROVED only when you are confident the milestone "
-            "is genuinely proven, otherwise REJECTED.\n\n"
-            "Return ONLY a JSON object with this exact schema:\n"
-            "{\n"
-            '  "verdict": "APPROVED" | "REJECTED",\n'
-            '  "confidence": 0.0-1.0,\n'
-            '  "checks": {\n'
-            '    "doc_type_valid": {"pass": true, "note": "..."},\n'
-            '    "supplier_name_match": {"pass": true, "note": "..."},\n'
-            '    "nominal_proportional": {"pass": true, "note": "..."},\n'
-            '    "date_valid": {"pass": true, "note": "..."},\n'
-            '    "doc_authenticity": {"pass": true, "note": "..."}\n'
-            "  },\n"
-            '  "fail_reasons": ["..."],\n'
-            '  "display_message": "One sentence summary for the supplier."\n'
-            "}"
+        # Build a specialized prompt for this exact (product_type, milestone_idx) combo.
+        # Each milestone has different document expectations, check names, and thresholds
+        # per PRD v3.0 §Milestone Details.
+        prompt, _prompt_tag = _build_milestone_prompt(
+            milestone_idx=milestone_idx,
+            product_type=str(product_type),
+            financing_meta=financing_meta,
         )
 
         try:
