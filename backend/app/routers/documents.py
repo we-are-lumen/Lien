@@ -29,7 +29,7 @@ from app.services.chain import get_chain_client
 from app.services.doc_hash import compute_doc_hash
 from app.services.ipfs import get_ipfs_client
 from app.services.milestones import for_product
-from app.services.pricing import advance_rate_for, price, tier_for
+from app.services.pricing import advance_rate_for, pool_cap_for, price
 
 
 router = APIRouter()
@@ -105,6 +105,19 @@ async def upload_document(
         raise BadRequest(
             f"Document rejected by AI verifier (risk score {verdict.risk_score}). "
             "See flags for details."
+        )
+
+    # Pool cap check (PRD v3.0 §Risk Tiers — Pool Caps).
+    # Validate against the cap before any external side-effects
+    # (IPFS upload, on-chain registration).
+    advance_rate_early = advance_rate_for(document_type, verdict.risk_tier)  # type: ignore[arg-type]
+    face_early = Decimal(total_amount) * Decimal(advance_rate_early) / Decimal(100)
+    cap = pool_cap_for(document_type, verdict.risk_tier)
+    if cap is not None and face_early > cap:
+        raise BadRequest(
+            f"Funding amount {float(face_early):,.2f} exceeds the pool cap of "
+            f"{float(cap):,.2f} for {verdict.risk_tier}-risk {document_type} financings. "
+            "Please split the financing into smaller tranches."
         )
 
     # Upload file and metadata to IPFS.
