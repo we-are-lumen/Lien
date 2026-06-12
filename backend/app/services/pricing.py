@@ -116,10 +116,27 @@ def price(
 
     # Face value the investor is funding (after advance rate haircut).
     face = (nominal * advance_decimal).quantize(Decimal("0.01"))
-    discount = (yield_rate * Decimal(tenor_days) / Decimal(365)).quantize(Decimal("0.0001"))
+    # IMPORTANT: do not pre-quantize `discount` — quantizing to 0.0001 strips
+    # ~$0.58 of precision on $15K deals and drifts the funded amount off the
+    # PRD example by ~$1 (PRD says $14,753, was reading $14,754). Let the
+    # full Decimal precision flow into the funding_amount calculation and
+    # only round the final dollar amount.
+    discount = yield_rate * Decimal(tenor_days) / Decimal(365)
     funding_amount = (face * (Decimal("1") - discount)).quantize(Decimal("0.01"))
     expected_yield = (face - funding_amount).quantize(Decimal("0.01"))
 
+    # Origination fee MUST be computed on funding_amount (the cash investor
+    # actually deposits) — this matches FundingPool.fund() which takes
+    # `origination = fundedAmount * ORIGINATION_FEE_BPS / BPS_DENOM` at
+    # contracts/src/FundingPool.sol:135. Computing it on face here would
+    # cause BE-displayed fees to diverge from what the contract actually
+    # transfers to treasury (~$4 per $15K deal).
+    #
+    # NOTE: PRD v3.0's numeric example shows origination=$225 on a $15K
+    # invoice, which is 1.5% × nominal/face. That example is internally
+    # inconsistent (1.5% × $14,753 = $221.30, not $225) and conflicts with
+    # the prose definition "deducted from funded_amount". The contract is
+    # the source of truth; PRD example math is a documentation bug.
     origination = (funding_amount * Decimal(ORIGINATION_FEE_BPS) / Decimal(10_000)).quantize(Decimal("0.01"))
     performance = (expected_yield * Decimal(PERFORMANCE_FEE_BPS) / Decimal(10_000)).quantize(Decimal("0.01"))
 
