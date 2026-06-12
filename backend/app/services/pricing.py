@@ -116,7 +116,12 @@ def price(
 
     # Face value the investor is funding (after advance rate haircut).
     face = (nominal * advance_decimal).quantize(Decimal("0.01"))
-    discount = (yield_rate * Decimal(tenor_days) / Decimal(365)).quantize(Decimal("0.0001"))
+    # IMPORTANT: do not pre-quantize `discount` — quantizing to 0.0001 strips
+    # ~$0.58 of precision on $15K deals and drifts the funded amount off the
+    # PRD example by ~$1 (PRD says $14,753, was reading $14,754). Let the
+    # full Decimal precision flow into the funding_amount calculation and
+    # only round the final dollar amount.
+    discount = yield_rate * Decimal(tenor_days) / Decimal(365)
     funding_amount = (face * (Decimal("1") - discount)).quantize(Decimal("0.01"))
     expected_yield = (face - funding_amount).quantize(Decimal("0.01"))
 
