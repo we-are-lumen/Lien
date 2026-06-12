@@ -24,6 +24,7 @@ from app.core.auth import require_auth
 from app.core.errors import BadRequest, Conflict, NotFound
 from app.models import schemas
 from app.services import repos
+from app.services.buyer_anon import anonymize_buyer_name
 
 
 router = APIRouter()
@@ -147,7 +148,9 @@ async def get_financing_detail(financing_id: str) -> schemas.FinancingDetail:
         id=row["id"],
         invoice_number=doc.get("invoice_number") or doc.get("po_number") or "",
         amount=float(row["amount"]),
-        buyer_name=doc.get("buyer_name", ""),
+        # Public endpoint: anonymize non-IDX buyers (PRD v3.0 §Buyer anonymization).
+        # IDX-listed names pass through; others become "Buyer #ABCDEF".
+        buyer_name=anonymize_buyer_name(doc.get("buyer_name", "")),
         due_date=row["due_date"],
         payment_status=row["payment_status"],
         yield_rate=float(row["yield_rate"]),
