@@ -35,6 +35,48 @@ class WebhookPayload(BaseModel):
     submitted_by: Annotated[str, Field(min_length=1, max_length=100)]
 
 
+class FundedPayload(BaseModel):
+    """Goldsky-forwarded Funded event from FundingPool.fund().
+
+    Event signature: ``Funded(uint256 indexed tokenId, address indexed investor, uint256 amount)``.
+
+    On Funded we close the gap between off-chain financing UUID and on-chain
+    tokenId by writing financings.token_id. Subsequent ProofSubmitted webhooks
+    use token_id -> financing_id resolution.
+
+    Lookup: we match the event to the pre-existing financings row by tx_hash
+    (which the FE submits to /financing/{id}/fund right after the wagmi tx
+    confirms). If no row matches the tx_hash, return ``{indexed: false}`` so
+    Goldsky retries — the bookkeeping POST may arrive after the event in race
+    conditions on testnet.
+    """
+    token_id: Annotated[int, Field(ge=0)]
+    investor: Annotated[str, Field(min_length=42, max_length=42)]  # 0x + 40 hex
+    amount: Annotated[str, Field(min_length=1, max_length=78)]      # uint256 as string
+    tx_hash: Annotated[str, Field(min_length=66, max_length=66)]    # 0x + 64 hex
+    block_number: Annotated[int, Field(ge=0)]
+
+
+class RepaidPayload(BaseModel):
+    """Goldsky-forwarded Repaid event from FundingPool.repay().
+
+    Event signature: ``Repaid(uint256 indexed tokenId, uint256 totalPaid, uint256 toInvestor)``.
+
+    Flips financings.status from ``in_progress`` → ``repaid`` and stamps
+    ``repaid_at`` + ``repay_tx_hash`` so the FE can render the happy-path
+    completion state. This is the BE-side piece of the supplier's direct
+    on-chain ``FundingPool.repay()`` call (no /repayment endpoint per design).
+
+    Idempotent: replays just no-op because status is already ``repaid`` and
+    repay_tx_hash is unchanged.
+    """
+    token_id: Annotated[int, Field(ge=0)]
+    total_paid: Annotated[str, Field(min_length=1, max_length=78)]
+    to_investor: Annotated[str, Field(min_length=1, max_length=78)]
+    tx_hash: Annotated[str, Field(min_length=66, max_length=66)]
+    block_number: Annotated[int, Field(ge=0)]
+
+
 def _enqueue_job(payload: WebhookPayload) -> dict:
     sb = get_supabase()
 
@@ -82,6 +124,117 @@ def _enqueue_job(payload: WebhookPayload) -> dict:
     return {"queued": True, "queue_id": result.data[0]["id"]}
 
 
+def _handle_funded(payload: FundedPayload) -> dict:
+    """Write financings.token_id by matching on fund_tx_hash.
+
+    The FE's /financing/{id}/fund POST sets fund_tx_hash before this event
+    arrives (real-mode flow); on testnet ordering can flip, so a miss here
+    must instruct Goldsky to retry rather than 404.
+
+    Idempotent: if token_id is already set to the same value, the update is a
+    no-op. Conflicting token_id is a data-integrity error worth surfacing.
+    """
+    sb = get_supabase()
+    rows = (
+        sb.table("financings")
+        .select("id, token_id")
+        .eq("fund_tx_hash", payload.tx_hash)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if not rows:
+        # Event arrived before the FE bookkeeping POST. Goldsky should retry.
+        return {
+            "indexed": False,
+            "error": f"No financing found for fund_tx_hash={payload.tx_hash[:18]}...",
+        }
+
+    row = rows[0]
+    financing_id = str(row["id"])  # type: ignore[index]
+    existing = row.get("token_id")  # type: ignore[union-attr]
+    incoming = str(payload.token_id)
+
+    if existing is not None and str(existing) != incoming:
+        # Same fund_tx_hash mapping to a different token_id — shouldn't happen.
+        # Don't overwrite silently; flag for manual reconciliation.
+        return {
+            "indexed": False,
+            "error": (
+                f"token_id conflict for financing {financing_id}: "
+                f"existing={existing} incoming={incoming}"
+            ),
+        }
+
+    if existing is None:
+        sb.table("financings").update({"token_id": incoming}).eq("id", financing_id).execute()
+
+    return {"indexed": True, "financing_id": financing_id, "token_id": incoming}
+
+
+def _handle_repaid(payload: RepaidPayload) -> dict:
+    """Flip financings.status to 'repaid' + stamp repay_tx_hash.
+
+    Idempotent: if status is already 'repaid' AND repay_tx_hash matches,
+    no-op. If status is in a state where repaid is invalid (defaulted,
+    blacklisted), refuse to overwrite — on-chain Repaid on a defaulted
+    deal would be a contract bug worth surfacing, not auto-resolving.
+    """
+    sb = get_supabase()
+    rows = (
+        sb.table("financings")
+        .select("id, status, repay_tx_hash")
+        .eq("token_id", str(payload.token_id))
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if not rows:
+        return {
+            "indexed": False,
+            "error": f"No financing found for token_id={payload.token_id}",
+        }
+
+    row = rows[0]
+    financing_id = str(row["id"])  # type: ignore[index]
+    current_status = row.get("status")  # type: ignore[union-attr]
+    current_tx = row.get("repay_tx_hash")  # type: ignore[union-attr]
+
+    # Idempotent replay (same tx_hash).
+    if current_status == "repaid" and current_tx == payload.tx_hash:
+        return {"indexed": True, "financing_id": financing_id, "noop": True}
+
+    # Already repaid but with a DIFFERENT tx_hash — refuse to overwrite.
+    # Could indicate a Goldsky replay attack or duplicate event delivery from
+    # a different on-chain tx. Surface for manual reconciliation instead of
+    # silently stomping the original repayment record.
+    if current_status == "repaid" and current_tx != payload.tx_hash:
+        return {
+            "indexed": False,
+            "error": (
+                f"Refusing to overwrite repay_tx_hash for financing {financing_id}: "
+                f"existing={current_tx} incoming={payload.tx_hash}"
+            ),
+        }
+
+    # Refuse to overwrite terminal non-repaid states.
+    if current_status in ("defaulted", "blacklisted"):
+        return {
+            "indexed": False,
+            "error": (
+                f"Refusing to mark financing {financing_id} repaid: "
+                f"current status is {current_status}"
+            ),
+        }
+
+    sb.table("financings").update({
+        "status": "repaid",
+        "repay_tx_hash": payload.tx_hash,
+    }).eq("id", financing_id).execute()
+
+    return {"indexed": True, "financing_id": financing_id, "status": "repaid"}
+
+
 def _fetch_status_jobs() -> tuple[list, list]:
     sb = get_supabase()
     jobs_rows = (
@@ -118,6 +271,20 @@ def _fetch_decisions(financing_id: str) -> list:
     ).data or []
 
 
+def _check_webhook_secret(x_webhook_secret: Optional[str]) -> None:
+    """Shared webhook auth: constant-time compare against settings.webhook_secret.
+
+    Raises Unauthorized if the secret is configured and doesn't match. If unset
+    (None/empty), accepts all callers — dev/local mode.
+    """
+    settings = get_settings()
+    if settings.webhook_secret:
+        if not x_webhook_secret or not hmac.compare_digest(
+            x_webhook_secret, settings.webhook_secret
+        ):
+            raise Unauthorized("Invalid or missing webhook secret")
+
+
 @router.post("/webhook")
 async def agent_webhook(
     payload: WebhookPayload,
@@ -129,14 +296,47 @@ async def agent_webhook(
     If ``webhook_secret`` is unset (None/empty), all callers are accepted (dev mode).
     """
     import asyncio
-    settings = get_settings()
-    if settings.webhook_secret:
-        if not x_webhook_secret or not hmac.compare_digest(
-            x_webhook_secret, settings.webhook_secret
-        ):
-            raise Unauthorized("Invalid or missing webhook secret")
-
+    _check_webhook_secret(x_webhook_secret)
     return await asyncio.to_thread(_enqueue_job, payload)
+
+
+@router.post("/webhook/funded")
+async def agent_webhook_funded(
+    payload: FundedPayload,
+    x_webhook_secret: Optional[str] = Header(default=None),
+) -> dict:
+    """Goldsky-forwarded ``Funded`` event.
+
+    Closes the off-chain financing UUID <-> on-chain tokenId gap by writing
+    financings.token_id. Without this, the ProofSubmitted webhook's
+    token_id -> financing_id lookup returns nothing in real Mantle mode and
+    the agent loop never fires.
+
+    Real-mode blocker (per PRD gap map). Lookup by fund_tx_hash, which the
+    FE writes to /financing/{id}/fund right after the wagmi tx confirms.
+    """
+    import asyncio
+    _check_webhook_secret(x_webhook_secret)
+    return await asyncio.to_thread(_handle_funded, payload)
+
+
+@router.post("/webhook/repaid")
+async def agent_webhook_repaid(
+    payload: RepaidPayload,
+    x_webhook_secret: Optional[str] = Header(default=None),
+) -> dict:
+    """Goldsky-forwarded ``Repaid`` event.
+
+    Flips financings.status to ``repaid`` and stamps repay_tx_hash. This is
+    the BE-side piece of the supplier's direct on-chain FundingPool.repay()
+    call (no /repayment endpoint per design — chain is the source of truth).
+
+    Without this, financings stay at ``in_progress`` forever after all
+    milestones release. The ``repaid`` enum value was dead before this PR.
+    """
+    import asyncio
+    _check_webhook_secret(x_webhook_secret)
+    return await asyncio.to_thread(_handle_repaid, payload)
 
 
 @router.get("/status")
