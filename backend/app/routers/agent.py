@@ -4,20 +4,44 @@ The webhook receives on-chain ProofSubmitted events (via Goldsky) and enqueues
 them into ``agent_queue``. The background agent loop (app.services.agent) picks
 them up. The status/decisions endpoints expose the queue and audit trail to the
 authenticated dashboard.
+
+## Goldsky retry semantics (https://docs.goldsky.com/turbo-pipelines/sinks/webhook)
+
+> The sink guarantees at-least-once delivery and retries transient failures
+> with exponential backoff, so your endpoint only needs to return a 2xx
+> status code to acknowledge the batch.
+
+Implication: returning 200 with ``{"indexed": False}`` on a race condition
+means Goldsky thinks the event was handled and **never retries**. That
+silently breaks the off-chain UUID ↔ on-chain tokenId mapping (the entire
+point of these webhooks) when the Funded event arrives before the FE's
+bookkeeping POST finishes — common on testnet where chain confirms in <2s.
+
+Convention used here:
+  - **5xx**  → transient, Goldsky retries with exponential backoff.
+              Use for race conditions (event arrived before BE caught up).
+  - **2xx**  → terminal, do NOT retry. Either success or a hard data error
+              that retrying won't fix (token_id conflict, status conflict).
+              Hard errors are returned as 200 with ``{"indexed": False,
+              "error": "..."}`` so the response body shows up in Goldsky's
+              delivery log for manual investigation.
 """
 
 from __future__ import annotations
 
 import hmac
+import logging
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.auth import require_auth
 from app.core.config import get_settings
 from app.core.db import get_supabase
 from app.core.errors import Unauthorized
+
+log = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -90,12 +114,17 @@ def _enqueue_job(payload: WebhookPayload) -> dict:
         .execute()
     ).data or []
     if not fin_rows:
-        # Not raising 404 here: webhook senders should retry. Return a clear
-        # status so Goldsky can backoff and replay once the financing is indexed.
-        return {
-            "queued": False,
-            "error": f"No financing found for token_id={payload.token_id}",
-        }
+        # RACE: ProofSubmitted arrived before the Funded handler wrote token_id.
+        # Return 503 so Goldsky retries with backoff (returning 200 here would
+        # silently drop the proof and the agent loop would never fire on it).
+        log.warning(
+            "webhook /agent/webhook: no financing for token_id=%s — requesting Goldsky retry",
+            payload.token_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"No financing yet for token_id={payload.token_id} — retry after Funded indexes",
+        )
     financing_id = str(fin_rows[0]["id"])  # type: ignore[index]
 
     existing = (
@@ -144,11 +173,19 @@ def _handle_funded(payload: FundedPayload) -> dict:
     ).data or []
 
     if not rows:
-        # Event arrived before the FE bookkeeping POST. Goldsky should retry.
-        return {
-            "indexed": False,
-            "error": f"No financing found for fund_tx_hash={payload.tx_hash[:18]}...",
-        }
+        # RACE: Funded event arrived before the FE's /financing/{id}/fund POST
+        # finished writing fund_tx_hash. Return 503 so Goldsky retries with
+        # exponential backoff. Returning 200 here would tell Goldsky "handled"
+        # and the off-chain UUID <-> on-chain tokenId mapping would silently
+        # never be written, breaking the entire agent loop in real mode.
+        log.warning(
+            "webhook /agent/webhook/funded: no financing for fund_tx_hash=%s... — requesting Goldsky retry",
+            payload.tx_hash[:18],
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"No financing yet for fund_tx_hash={payload.tx_hash[:18]}... — retry after FE writes it",
+        )
 
     row = rows[0]
     financing_id = str(row["id"])  # type: ignore[index]
@@ -190,10 +227,19 @@ def _handle_repaid(payload: RepaidPayload) -> dict:
     ).data or []
 
     if not rows:
-        return {
-            "indexed": False,
-            "error": f"No financing found for token_id={payload.token_id}",
-        }
+        # RACE: Repaid event arrived before Funded event was processed (so
+        # token_id is still unset on this financing). Should be impossible in
+        # contract logic (you can't repay an unfunded deal) but on testnet
+        # subgraph reorg + event reordering can produce this. Return 503 so
+        # Goldsky retries.
+        log.warning(
+            "webhook /agent/webhook/repaid: no financing for token_id=%s — requesting Goldsky retry",
+            payload.token_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"No financing yet for token_id={payload.token_id} — retry after Funded indexes",
+        )
 
     row = rows[0]
     financing_id = str(row["id"])  # type: ignore[index]

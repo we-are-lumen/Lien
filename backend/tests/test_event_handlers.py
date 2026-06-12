@@ -18,6 +18,9 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
+
 from app.routers.agent import (
     FundedPayload,
     RepaidPayload,
@@ -95,15 +98,19 @@ class TestHandleFunded:
         assert update_call is not None
         assert update_call[0][0] == {"token_id": "42"}
 
-    def test_returns_indexed_false_when_no_row_matches_tx_hash(self):
-        """Event arrived before FE bookkeeping POST — Goldsky must retry."""
+    def test_raises_503_when_no_row_matches_tx_hash(self):
+        """Race: Funded event arrived before FE bookkeeping POST. Must raise
+        HTTP 503 so Goldsky retries with backoff — Goldsky treats 2xx as
+        handled and would NEVER retry, breaking real-mode tokenId capture.
+        """
         sb = _make_sb_mock(select_data=[])
 
         with patch("app.routers.agent.get_supabase", return_value=sb):
-            result = _handle_funded(_funded())
+            with pytest.raises(HTTPException) as exc_info:
+                _handle_funded(_funded())
 
-        assert result["indexed"] is False
-        assert "No financing found" in result["error"]
+        assert exc_info.value.status_code == 503
+        assert "retry" in exc_info.value.detail.lower()
         # Critical: must NOT have called update.
         sb.table.return_value.update.assert_not_called()
 
@@ -152,14 +159,19 @@ class TestHandleRepaid:
             "repay_tx_hash": payload.tx_hash,
         }
 
-    def test_returns_indexed_false_when_token_id_not_found(self):
+    def test_raises_503_when_token_id_not_found(self):
+        """Race: Repaid event arrived before Funded event finished indexing.
+        Should be impossible per contract semantics but possible on testnet
+        with subgraph reorgs. Must raise 503 so Goldsky retries.
+        """
         sb = _make_sb_mock(select_data=[])
 
         with patch("app.routers.agent.get_supabase", return_value=sb):
-            result = _handle_repaid(_repaid())
+            with pytest.raises(HTTPException) as exc_info:
+                _handle_repaid(_repaid())
 
-        assert result["indexed"] is False
-        assert "No financing found" in result["error"]
+        assert exc_info.value.status_code == 503
+        assert "retry" in exc_info.value.detail.lower()
         sb.table.return_value.update.assert_not_called()
 
     def test_idempotent_replay_returns_noop(self):
@@ -221,4 +233,42 @@ class TestHandleRepaid:
 
         assert result["indexed"] is False
         assert "blacklisted" in result["error"]
+
+
+# ===========================================================================
+# _enqueue_job (ProofSubmitted webhook handler) — race condition handling
+# ===========================================================================
+#
+# When ProofSubmitted arrives before Funded has set token_id, the handler
+# can't resolve token_id -> financing_id. Must raise 503 so Goldsky retries
+# (per https://docs.goldsky.com/turbo-pipelines/sinks/webhook: only non-2xx
+# triggers retries). Returning 200 would silently drop the proof and the
+# agent loop would never fire.
+
+
+class TestEnqueueJobRetrySemantics:
+    def _make_proof_payload(self, token_id: int = 42) -> Any:
+        """Build a WebhookPayload-shaped object."""
+        from app.routers.agent import WebhookPayload
+        return WebhookPayload(
+            token_id=token_id,
+            milestone_idx=2,
+            ipfs_hash="QmTestHash" + "x" * 36,
+            submitted_by="0x" + "a" * 40,
+        )
+
+    def test_raises_503_when_token_id_not_indexed_yet(self):
+        """Race: ProofSubmitted arrived before Funded handler wrote token_id."""
+        from app.routers.agent import _enqueue_job
+        sb = _make_sb_mock(select_data=[])
+
+        with patch("app.routers.agent.get_supabase", return_value=sb):
+            with pytest.raises(HTTPException) as exc_info:
+                _enqueue_job(self._make_proof_payload(token_id=999))
+
+        assert exc_info.value.status_code == 503
+        assert "retry" in exc_info.value.detail.lower()
+        assert "999" in exc_info.value.detail
+        # Critical: must NOT have inserted a queue row.
+        sb.table.return_value.insert.assert_not_called()
         sb.table.return_value.update.assert_not_called()
