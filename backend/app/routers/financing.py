@@ -17,7 +17,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
+from pydantic import BaseModel, Field
 
 from app.core.auth import require_auth
 from app.core.errors import BadRequest, Conflict, NotFound
@@ -194,17 +195,56 @@ async def get_financing_report(financing_id: str) -> dict:
     }
 
 
+class FundFinancingBody(BaseModel):
+    """Optional body for /financing/{id}/fund.
+
+    In real Mantle mode, the FE must supply ``tx_hash`` — the wagmi receipt
+    hash from the investor's on-chain ``FundingPool.fund()`` call. The
+    Goldsky ``Funded`` event handler later matches this hash to write
+    ``financings.token_id``. Without it, the off-chain UUID never gets
+    linked to the on-chain token and the agent loop can't resolve
+    ProofSubmitted webhooks.
+
+    In mock mode this field is ignored — the BE mints a deterministic
+    tx_hash via ``MockChainClient.fund()``.
+    """
+    tx_hash: Optional[str] = Field(
+        default=None,
+        min_length=66,
+        max_length=66,
+        description="On-chain fund tx_hash (0x + 64 hex). Required in real mode.",
+    )
+
+
 @router.post("/financing/{financing_id}/fund")
 async def fund_financing(
     financing_id: str,
+    body: Optional[FundFinancingBody] = Body(default=None),
     address: str = Depends(require_auth),
 ) -> dict:
     """Investor funds a financing.
 
-    In the real flow the investor signs the on-chain `fund()` tx directly
-    via wagmi. This endpoint exists for the BE to record the bookkeeping
-    after the tx confirms, OR (in mock mode) to simulate the funding flow
-    end-to-end without a chain.
+    In the real flow the investor signs the on-chain ``fund()`` tx directly
+    via wagmi, which inside the same tx auto-releases M1 to the supplier
+    (``FundingPool.fund → _releaseMilestone(tokenId, 1)`` at
+    contracts/src/FundingPool.sol:155). This endpoint exists for the BE to
+    record the bookkeeping after the tx confirms, OR (in mock mode) to
+    simulate the funding flow end-to-end without a chain.
+
+    DO NOT call ``chain.release_milestone(_, 1)`` from here — in real mode
+    it reverts ``MilestoneAlreadyReleased`` because ``FundingPool.fund``
+    already did the M1 release inside the investor's tx. Both M1 release
+    and the fund deposit share the same tx_hash.
+
+    Modes:
+      - ``chain_mock_mode=True`` (local/dev): the BE mints a deterministic
+        ``fund_tx_hash`` via ``MockChainClient.fund(financing_id)``. Body
+        ``tx_hash`` is ignored.
+      - ``chain_mock_mode=False`` (real Mantle): the FE must supply the
+        wagmi receipt ``tx_hash`` in the body. The Goldsky ``Funded`` event
+        handler later matches this hash to write ``financings.token_id``.
+        Missing ``tx_hash`` raises 400 — without it the off-chain UUID
+        never gets linked to the on-chain token.
     """
     fin = repos.get_financing(financing_id)
     if not fin:
@@ -225,25 +265,39 @@ async def fund_financing(
         }
     )
 
-    # Auto-release M1 (always idx=1, auto=true) and flip status.
+    # Resolve fund_tx_hash by mode.
     from app.services.chain import get_chain_client
+    from app.core.config import get_settings
     chain = get_chain_client()
-    release = await chain.release_milestone(financing_id, 1)
+    settings = get_settings()
+    if settings.chain_mock_mode:
+        fund_tx_hash = await chain.fund(financing_id)
+    else:
+        # Real Mantle: require the FE-supplied receipt hash so the Goldsky
+        # Funded handler can later resolve token_id by matching this value.
+        if body is None or not body.tx_hash:
+            raise BadRequest(
+                "tx_hash required in real chain mode — supply the wagmi "
+                "receipt hash from the investor's FundingPool.fund() tx."
+            )
+        fund_tx_hash = body.tx_hash
+
+    # Mark M1 released — same tx_hash as fund (atomic on-chain).
     m1 = repos.get_milestone(financing_id, 1)
     if m1:
         repos.update_milestone(
             m1["id"],
-            {"status": "released", "release_tx_hash": release.tx_hash},
+            {"status": "released", "release_tx_hash": fund_tx_hash},
         )
 
     # Flip financing status.
     from app.core.db import get_supabase
     sb = get_supabase()
     sb.table("financings").update(
-        {"status": "funded", "fund_tx_hash": release.tx_hash}
+        {"status": "funded", "fund_tx_hash": fund_tx_hash}
     ).eq("id", financing_id).execute()
 
-    return {"funding_id": funding["id"], "release_tx_hash": release.tx_hash}
+    return {"funding_id": funding["id"], "fund_tx_hash": fund_tx_hash}
 
 
 @router.post("/financing/{financing_id}/milestone-proof")
