@@ -569,34 +569,58 @@ async def _process_job(job: dict) -> None:
         await asyncio.to_thread(_mark_failed, queue_id, str(exc))
 
 
-_TERMINAL_FINANCING_STATUSES = {"defaulted", "blacklisted", "frozen"}
+_TERMINAL_FINANCING_STATUSES = {"defaulted", "blacklisted"}
+# NOTE: "frozen" is intentionally NOT in this set. A freeze is temporary (48h).
+# After frozen_until passes, the financing must be allowed to advance to in_progress
+# once the next milestone releases. Treating frozen as permanently terminal would
+# leave the financing stuck in DB forever after the freeze window expires.
 
 
 def _advance_financing_status(financing_id: str) -> None:
     """After a milestone release, check if all milestones are released and update status.
 
-    Never overrides terminal or frozen statuses (defaulted, blacklisted, frozen).
+    Never overrides truly terminal statuses (defaulted, blacklisted).
     A replayed Goldsky event on a defaulted deal must not resurrect it.
+
+    Frozen is handled separately: a frozen financing whose freeze window has expired
+    is allowed to advance (the agent loop already cleared it via is_frozen() before
+    calling _process_job). If the freeze is still active, skip — the job will have
+    been requeued by the F1 guard before reaching this point anyway.
     """
     sb = get_supabase()
 
-    # Guard: don't touch terminal statuses.
+    # Guard: don't touch truly terminal statuses.
     financing_rows = (
         sb.table("financings")
-        .select("status")
+        .select("status, frozen_until")
         .eq("id", financing_id)
         .limit(1)
         .execute()
     ).data or []
     if not financing_rows:
         return
-    current_status: str = str((financing_rows[0] or {}).get("status", ""))  # type: ignore[union-attr]
+    row = financing_rows[0] or {}
+    current_status: str = str(row.get("status", ""))  # type: ignore[union-attr]
     if current_status in _TERMINAL_FINANCING_STATUSES:
         log.warning(
             "agent: _advance_financing_status skipped — financing %s is in terminal state %s",
             financing_id, current_status,
         )
         return
+
+    # Frozen check: if the financing is still within the freeze window, skip.
+    # In normal flow the F1 guard in _process_job already checked this and would
+    # have requeued before reaching here. This is a belt-and-suspenders guard.
+    if current_status == "frozen":
+        still_frozen, frozen_until = is_frozen(financing_id)
+        if still_frozen:
+            log.info(
+                "agent: _advance_financing_status skipped — financing %s still frozen until %s",
+                financing_id, frozen_until,
+            )
+            return
+        # Freeze has expired — fall through and let the milestone release
+        # flip the status to in_progress below.
 
     milestones = (
         sb.table("milestones")

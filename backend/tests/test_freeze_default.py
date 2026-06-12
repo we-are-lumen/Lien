@@ -288,3 +288,103 @@ class TestB1AutoDefault:
 
         assert set(result) == set(ids)
         assert mock_chain.mark_defaulted.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Regression: frozen status must not be permanent (freeze-expiry recovery)
+# ---------------------------------------------------------------------------
+
+class TestFreezeExpiry:
+    """After frozen_until passes, _advance_financing_status must allow
+    the financing to transition to in_progress — not stay 'frozen' forever."""
+
+    def test_frozen_status_advances_after_expiry(self):
+        """Simulates: freeze has expired, milestone releases, status flips to in_progress.
+
+        _advance_financing_status reads status+frozen_until from agent.get_supabase,
+        then calls is_frozen() which reads from freeze_default.get_supabase.
+        Both need to be patched independently.
+        """
+        from app.services.agent import _advance_financing_status
+
+        financing_id = "fin-freeze-recovery"
+        expired_frozen_until = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+
+        # --- agent.get_supabase mock ---
+        # First call: SELECT status, frozen_until FROM financings
+        # Second call: SELECT milestones
+        # Third call: UPDATE financings SET status=in_progress
+        financing_row_sb = _make_sb_mock(rows_data=[{
+            "status": "frozen",
+            "frozen_until": expired_frozen_until,
+        }])
+        milestone_sb = _make_sb_mock(rows_data=[
+            {"status": "released", "idx": 1, "release_tx_hash": "0xabc"},
+            {"status": "pending", "idx": 2, "release_tx_hash": None},
+        ])
+        # update() chain on the agent sb
+        update_q = MagicMock()
+        update_q.eq.return_value = update_q
+        update_q.execute.return_value = MagicMock()
+        financing_row_sb.table.return_value.update.return_value = update_q
+
+        _agent_table_calls: list[str] = []
+
+        def _agent_table_router(table_name: str) -> MagicMock:
+            _agent_table_calls.append(table_name)
+            if table_name == "financings":
+                return financing_row_sb.table(table_name)
+            return milestone_sb.table(table_name)
+
+        agent_sb = MagicMock()
+        agent_sb.table.side_effect = _agent_table_router
+
+        # --- freeze_default.get_supabase mock ---
+        # is_frozen() queries SELECT frozen_until FROM financings — same expired value.
+        freeze_sb = _make_sb_mock(rows_data=[{"frozen_until": expired_frozen_until}])
+
+        with (
+            patch("app.services.agent.get_supabase", return_value=agent_sb),
+            patch("app.services.freeze_default.get_supabase", return_value=freeze_sb),
+        ):
+            _advance_financing_status(financing_id)
+
+        # Must have called update on financings to flip to in_progress.
+        financing_row_sb.table.return_value.update.assert_called_once()
+        update_dict = financing_row_sb.table.return_value.update.call_args[0][0]
+        assert update_dict["status"] == "in_progress", (
+            f"Expected in_progress after freeze expiry, got {update_dict['status']!r}"
+        )
+
+    def test_frozen_status_skipped_while_still_frozen(self):
+        """If frozen_until is still in the future, _advance_financing_status must NOT update."""
+        from app.services.agent import _advance_financing_status
+
+        financing_id = "fin-still-frozen"
+        active_frozen_until = (
+            datetime.now(timezone.utc) + timedelta(hours=24)
+        ).isoformat()
+
+        financing_row_sb = _make_sb_mock(rows_data=[{
+            "status": "frozen",
+            "frozen_until": active_frozen_until,
+        }])
+        # freeze_default.get_supabase for is_frozen() — same active timestamp
+        freeze_sb = _make_sb_mock(rows_data=[{"frozen_until": active_frozen_until}])
+
+        def _agent_table_router(table_name: str) -> MagicMock:
+            return financing_row_sb.table(table_name)
+
+        agent_sb = MagicMock()
+        agent_sb.table.side_effect = _agent_table_router
+
+        with (
+            patch("app.services.agent.get_supabase", return_value=agent_sb),
+            patch("app.services.freeze_default.get_supabase", return_value=freeze_sb),
+        ):
+            _advance_financing_status(financing_id)
+
+        # Must NOT have called update — freeze still active.
+        financing_row_sb.table.return_value.update.assert_not_called()
