@@ -200,9 +200,22 @@ def _handle_repaid(payload: RepaidPayload) -> dict:
     current_status = row.get("status")  # type: ignore[union-attr]
     current_tx = row.get("repay_tx_hash")  # type: ignore[union-attr]
 
-    # Idempotent replay.
+    # Idempotent replay (same tx_hash).
     if current_status == "repaid" and current_tx == payload.tx_hash:
         return {"indexed": True, "financing_id": financing_id, "noop": True}
+
+    # Already repaid but with a DIFFERENT tx_hash — refuse to overwrite.
+    # Could indicate a Goldsky replay attack or duplicate event delivery from
+    # a different on-chain tx. Surface for manual reconciliation instead of
+    # silently stomping the original repayment record.
+    if current_status == "repaid" and current_tx != payload.tx_hash:
+        return {
+            "indexed": False,
+            "error": (
+                f"Refusing to overwrite repay_tx_hash for financing {financing_id}: "
+                f"existing={current_tx} incoming={payload.tx_hash}"
+            ),
+        }
 
     # Refuse to overwrite terminal non-repaid states.
     if current_status in ("defaulted", "blacklisted"):

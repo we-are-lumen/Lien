@@ -175,6 +175,28 @@ class TestHandleRepaid:
         assert result == {"indexed": True, "financing_id": "fin-1", "noop": True}
         sb.table.return_value.update.assert_not_called()
 
+    def test_refuses_overwrite_when_already_repaid_with_different_tx_hash(self):
+        """Already-repaid but tx_hash differs → must NOT overwrite.
+
+        Could indicate a Goldsky replay, duplicate event delivery from a
+        different on-chain tx, or a manual DB tweak. Either way, silently
+        stomping the original repayment record would lose audit history.
+        """
+        existing_tx = "0x" + "c" * 64
+        incoming_tx = "0x" + "d" * 64
+        sb = _make_sb_mock(select_data=[
+            {"id": "fin-1", "status": "repaid", "repay_tx_hash": existing_tx},
+        ])
+
+        with patch("app.routers.agent.get_supabase", return_value=sb):
+            result = _handle_repaid(_repaid(tx_hash=incoming_tx))
+
+        assert result["indexed"] is False
+        assert "Refusing to overwrite" in result["error"]
+        assert existing_tx in result["error"]
+        assert incoming_tx in result["error"]
+        sb.table.return_value.update.assert_not_called()
+
     def test_refuses_to_overwrite_defaulted_status(self):
         """A Repaid event arriving for a defaulted financing is a contract bug —
         don't auto-resolve, surface it."""
