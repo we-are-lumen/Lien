@@ -5,9 +5,9 @@ import PainPointListItem from "./PainPointListItem";
 
 const PainPointSection = () => {
   return (
-    <Center pb={50}>
+    <Center pb={50} h={"80dvh"}>
       <Flex direction={"column"} align={"center"} gap={10} px={100}>
-        <Title>The Trade Finance Problem</Title>
+        <Title className="tracking-tighter">The Trade Finance Problem</Title>
         <Text ta={"center"}>
           SMEs across Southeast Asia face a $45 billion funding gap. <br />{" "}
           Traditional options are slow, expensive, or inaccessible.
