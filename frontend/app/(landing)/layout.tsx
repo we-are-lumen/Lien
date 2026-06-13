@@ -1,3 +1,4 @@
+import LandingFooter from "@/shared/components/navigations/LandingFooter";
 import LandingNavbar from "@/shared/components/navigations/LandingNavbar";
 
 export default function LandingLayout({
@@ -9,6 +10,7 @@ export default function LandingLayout({
     <div>
       <LandingNavbar />
       {children}
+      <LandingFooter />
     </div>
   );
 }
