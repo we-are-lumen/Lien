@@ -1,14 +1,16 @@
+import CtaSection from "./components/CtaSection";
 import HeroSection from "./components/HeroSection";
 import PainPointSection from "./components/PainPointSection";
 import SolutionSection from "./components/SolutionSection";
 
 const LandingPage = () => {
   return (
-    <div>
+    <main>
       <HeroSection />
       <PainPointSection />
       <SolutionSection />
-    </div>
+      <CtaSection />
+    </main>
   );
 };
 

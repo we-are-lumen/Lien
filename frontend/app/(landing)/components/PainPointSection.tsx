@@ -5,7 +5,7 @@ import PainPointListItem from "./PainPointListItem";
 
 const PainPointSection = () => {
   return (
-    <Center pb={50} h={"80dvh"}>
+    <Center py={120}>
       <Flex direction={"column"} align={"center"} gap={10} px={100}>
         <Title className="tracking-tighter">The Trade Finance Problem</Title>
         <Text ta={"center"}>

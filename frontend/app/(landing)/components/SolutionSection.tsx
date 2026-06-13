@@ -3,7 +3,7 @@ import SolutionCard from "./SolutionCard";
 
 const SolutionSection = () => {
   return (
-    <Center h={"80dvh"}>
+    <Center my={120}>
       <Flex direction={"column"} align={"center"} gap={10} px={100}>
         <Title className="tracking-tighter">Two Financing Solutions</Title>
         <Text ta={"center"}>
