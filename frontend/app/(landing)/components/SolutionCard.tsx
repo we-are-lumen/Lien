@@ -2,13 +2,16 @@
 
 import { Box, Flex, Group, Paper, Text, Title } from "@mantine/core";
 import { CheckIcon } from "@phosphor-icons/react";
+import { ReactNode } from "react";
 
 const SolutionCard = ({
+  icon,
   title,
   description,
   checkItems,
   idealFor,
 }: {
+  icon: ReactNode;
   title: string;
   description: string;
   checkItems: string[];
@@ -16,7 +19,8 @@ const SolutionCard = ({
 }) => {
   return (
     <Paper bd={"1px solid black"} p={20} maw={"27rem"}>
-      <Group>
+      <Group gap={"xs"} mb={16}>
+        {icon}
         <Title order={3}>{title}</Title>
       </Group>
       <Text c={"dimmed"}>{description}</Text>
@@ -28,7 +32,7 @@ const SolutionCard = ({
           </Group>
         ))}
       </Flex>
-      <Box p={16} bg={"grey.1"}>
+      <Box p={16} bg={"gray.1"}>
         <Text size="sm" c={"dimmed"}>
           <strong>Ideal for: </strong>
           {idealFor}.

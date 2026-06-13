@@ -1,4 +1,7 @@
+"use client";
+
 import { Center, Flex, Text, Title } from "@mantine/core";
+import { DiamondsFourIcon, ExcludeSquareIcon } from "@phosphor-icons/react";
 import SolutionCard from "./SolutionCard";
 
 const SolutionSection = () => {
@@ -12,6 +15,7 @@ const SolutionSection = () => {
         </Text>
         <Flex mt={20} gap={20}>
           <SolutionCard
+            icon={<DiamondsFourIcon weight="fill" size={"1.3rem"} />}
             title="Invoice Financing"
             description="Delivered goods or services but waiting for payment? Get paid in 24 hours instead of 60+ days."
             checkItems={[
@@ -23,6 +27,7 @@ const SolutionSection = () => {
             idealFor="Suppliers with proven payment history needing immediate working capital"
           />
           <SolutionCard
+            icon={<ExcludeSquareIcon weight="fill" size={"1.3rem"} />}
             title="PO Financing"
             description="Secured a PO but lack capital to produce? Get funded upfront to fulfill orders and scale."
             checkItems={[

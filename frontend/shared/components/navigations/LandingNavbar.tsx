@@ -3,7 +3,7 @@ import Link from "next/link";
 
 const LandingNavbar = () => {
   return (
-    <Box bg="white">
+    <Box bg="white" pos={"sticky"} top={0} style={{ zIndex: 99 }}>
       <Flex
         px={100}
         py={20}
