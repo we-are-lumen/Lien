@@ -5,7 +5,7 @@ const HeroSection = () => {
     <Center h={"90dvh"}>
       <Flex direction={"column"} align={"center"} gap={20} px={250}>
         <Title
-          size={"4rem"}
+          size={"3.7rem"}
           ta={"center"}
           fw={900}
           className="tracking-tighter leading-none!"
