@@ -2,6 +2,7 @@ import { createTheme } from "@mantine/core";
 
 export const appTheme = createTheme({
     fontFamily: 'DM Sans, sans-serif',
+    white: '#FAF9F6',
     colors: {
         primary: [
             '#e8f6f5',
@@ -16,5 +17,7 @@ export const appTheme = createTheme({
             '#155c5a',
         ]
     },
-    primaryColor: 'primary'
+    primaryColor: 'primary',
+    defaultRadius: 'xs'
+
 });
