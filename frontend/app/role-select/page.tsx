@@ -1,17 +1,26 @@
-import { Center, Flex, Text, Title } from "@mantine/core";
+"use client";
+
+import { Button, Center, Flex, Text, Title } from "@mantine/core";
 import RoleCard from "./components/RoleCard";
+import { useState } from "react";
 
 const RoleSelectPage = () => {
+  const [selectedRole, setselectedRole] = useState<string>();
+
   return (
     <Center h={"100dvh"}>
       <Flex direction={"column"} align={"center"}>
-        <Title ta={"center"}>Welcome to Lien</Title>
+        <Title ta={"center"} className="tracking-tighter">
+          Welcome to Lien
+        </Title>
         <Text size="lg" ta={"center"}>
           How would you like to use the platform? Select your role to set up
           your dashboard.
         </Text>
         <Flex mt={20} gap={20}>
           <RoleCard
+            isSelected={selectedRole === "supplier"}
+            onSelect={() => setselectedRole("supplier")}
             title="I am a Supplier"
             description="Turn your unpaid invoices and Purchase Orders into instant liquidity."
             benefits={[
@@ -21,7 +30,9 @@ const RoleSelectPage = () => {
             ]}
           />
           <RoleCard
-            title="I am a Investor"
+            isSelected={selectedRole === "investor"}
+            onSelect={() => setselectedRole("investor")}
+            title="I am an Investor"
             description="Fund AI-verified real-world businesses and earn uncorrelated yields."
             benefits={[
               "Earn 6% to 18% APR.",
@@ -30,6 +41,13 @@ const RoleSelectPage = () => {
             ]}
           />
         </Flex>
+        {selectedRole && (
+          <Button mt={50}>
+            <p>
+              Continue as <span className="capitalize"> {selectedRole}</span>
+            </p>
+          </Button>
+        )}
       </Flex>
     </Center>
   );
