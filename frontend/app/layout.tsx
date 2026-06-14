@@ -1,5 +1,6 @@
 import MainProvider from "@/shared/components/providers/MainProvider";
 import "@mantine/core/styles.css";
+import "@mantine/notifications/styles.css";
 import type { Metadata } from "next";
 import { DM_Sans } from "next/font/google";
 import "./globals.css";

@@ -1,6 +1,6 @@
 "use client";
 
-import { Box, Flex, Paper, Text, Title } from "@mantine/core";
+import { Flex, Paper, Text, Title } from "@mantine/core";
 import { CheckIcon } from "@phosphor-icons/react";
 
 const RoleCard = ({
